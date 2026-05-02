@@ -70,6 +70,24 @@ pub struct NewsSearchResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// A single image result from Kagi Images.
+pub struct ImageSearchResult {
+    #[serde(default)]
+    pub rank: Option<u32>,
+    pub title: String,
+    pub image_url: String,
+    pub thumbnail_url: String,
+    #[serde(default)]
+    pub source_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// Wrapper for a list of image search results.
+pub struct ImageSearchResponse {
+    pub data: Vec<ImageSearchResult>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 /// Metadata returned with most Kagi API responses (request ID, node, latency).
 pub struct ApiMeta {
     pub id: String,

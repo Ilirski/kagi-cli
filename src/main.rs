@@ -53,7 +53,7 @@ use crate::quick::{execute_quick, format_quick_markdown, format_quick_pretty};
 use crate::types::{
     AskPageRequest, AssistantProfileCreateRequest, AssistantProfileUpdateRequest,
     AssistantPromptRequest, CustomBangCreateRequest, CustomBangUpdateRequest, FastGptRequest,
-    LensCreateRequest, LensUpdateRequest, NewsSearchResponse, QuickResponse,
+    ImageSearchResponse, LensCreateRequest, LensUpdateRequest, NewsSearchResponse, QuickResponse,
     RedirectRuleCreateRequest, RedirectRuleUpdateRequest, SearchResponse,
     SubscriberSummarizeRequest, SummarizeRequest, TranslateCommandRequest,
 };
@@ -345,6 +345,32 @@ async fn run() -> Result<(), KagiError> {
                 )
                 .await
             }
+        }
+        Commands::Images(args) => {
+            args.validate().map_err(KagiError::Config)?;
+            let request = search::ImageSearchRequest::new(args.query);
+            let format_str = match args.format {
+                cli::OutputFormat::Json => "json",
+                cli::OutputFormat::Pretty => "pretty",
+                cli::OutputFormat::Compact => "compact",
+                cli::OutputFormat::Markdown => "markdown",
+                cli::OutputFormat::Csv => "csv",
+                cli::OutputFormat::Toon => {
+                    return Err(KagiError::Config(
+                        "images does not support --format toon".to_string(),
+                    ));
+                }
+            };
+            run_image_search(
+                request,
+                format_str,
+                !args.no_color,
+                args.local_cache,
+                args.cache_ttl.unwrap_or(900),
+                args.limit,
+                profile.as_deref(),
+            )
+            .await
         }
         Commands::Auth(auth) => match auth.command {
             AuthSubcommand::Status => run_auth_status(profile.as_deref()),
@@ -2264,6 +2290,46 @@ async fn run_search(
     Ok(())
 }
 
+async fn run_image_search(
+    request: search::ImageSearchRequest,
+    format: &str,
+    use_color: bool,
+    local_cache: bool,
+    cache_ttl: u64,
+    limit: Option<usize>,
+    profile: Option<&str>,
+) -> Result<(), KagiError> {
+    let token = resolve_session_token(profile)?;
+    let response = cached_json(local_cache, cache_ttl, "images", &request, || async {
+        search::execute_image_search(&request, &token).await
+    })
+    .await?;
+    record_history("images", Some(&request.query), Some(response.data.len()))?;
+    let mut response = response;
+    if let Some(n) = limit {
+        response.data.truncate(n);
+    }
+
+    let output = match format {
+        "pretty" => format_image_pretty_response(&response, use_color),
+        "compact" => serde_json::to_string(&response).map_err(|error| {
+            KagiError::Parse(format!(
+                "failed to serialize image search response: {error}"
+            ))
+        })?,
+        "markdown" => format_image_markdown_response(&response),
+        "csv" => format_image_csv_response(&response),
+        _ => serde_json::to_string_pretty(&response).map_err(|error| {
+            KagiError::Parse(format!(
+                "failed to serialize image search response: {error}"
+            ))
+        })?,
+    };
+
+    println!("{output}");
+    Ok(())
+}
+
 fn format_template_response(response: &SearchResponse, template: &str) -> String {
     response
         .data
@@ -2603,6 +2669,95 @@ fn format_csv_news_response(response: &NewsSearchResponse) -> String {
             ));
         }
     }
+    output
+}
+
+fn format_image_pretty_response(response: &ImageSearchResponse, use_color: bool) -> String {
+    if response.data.is_empty() {
+        return "No image results found.".to_string();
+    }
+
+    response
+        .data
+        .iter()
+        .enumerate()
+        .map(|(index, result)| {
+            let title_color = if use_color { "\x1b[1;34m" } else { "" };
+            let url_color = if use_color { "\x1b[36m" } else { "" };
+            let reset_color = if use_color { "\x1b[0m" } else { "" };
+
+            let mut section = format!(
+                "{}{}. {}{}\n   image: {}{}{}",
+                title_color,
+                index + 1,
+                result.title,
+                reset_color,
+                url_color,
+                result.image_url,
+                reset_color
+            );
+            if result.thumbnail_url != result.image_url {
+                section.push_str(&format!(
+                    "\n   thumb: {}{}{}",
+                    url_color, result.thumbnail_url, reset_color
+                ));
+            }
+            if let Some(source_url) = result.source_url.as_deref() {
+                section.push_str(&format!(
+                    "\n   source: {}{}{}",
+                    url_color, source_url, reset_color
+                ));
+            }
+            section
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+fn format_image_markdown_response(response: &ImageSearchResponse) -> String {
+    if response.data.is_empty() {
+        return "# No image results found.".to_string();
+    }
+
+    response
+        .data
+        .iter()
+        .enumerate()
+        .map(|(index, result)| {
+            let mut section = format!(
+                "## {}. {}\n\n![{}]({})\n\nImage: <{}>\n\n",
+                index + 1,
+                result.title,
+                result.title,
+                result.thumbnail_url,
+                result.image_url
+            );
+            if let Some(source_url) = result.source_url.as_deref() {
+                section.push_str(&format!("Source: <{source_url}>\n\n"));
+            }
+            section
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn format_image_csv_response(response: &ImageSearchResponse) -> String {
+    if response.data.is_empty() {
+        return "title,image_url,thumbnail_url,source_url".to_string();
+    }
+
+    let mut output = String::from("title,image_url,thumbnail_url,source_url\n");
+
+    for result in &response.data {
+        let title = escape_csv_field(&result.title);
+        let image_url = escape_csv_field(&result.image_url);
+        let thumbnail_url = escape_csv_field(&result.thumbnail_url);
+        let source_url = escape_csv_field(result.source_url.as_deref().unwrap_or(""));
+        output.push_str(&format!(
+            "{title},{image_url},{thumbnail_url},{source_url}\n"
+        ));
+    }
+
     output
 }
 
@@ -5339,15 +5494,16 @@ mod tests {
     use super::{
         RateLimiter, SearchRequestOptions, bool_flag_choice, build_search_request,
         format_assistant_markdown, format_assistant_pretty, format_batch_failure_message,
-        format_csv_response, format_markdown_response, format_pretty_response,
+        format_csv_response, format_image_csv_response, format_image_markdown_response,
+        format_image_pretty_response, format_markdown_response, format_pretty_response,
         is_bare_auth_invocation_from, parse_context_memory_json, print_assistant_response,
         should_fallback_to_session,
     };
     use crate::cli::{AssistantOutputFormat, SearchOrder, SearchTime};
     use crate::error::KagiError;
     use crate::types::{
-        AssistantMessage, AssistantMeta, AssistantPromptResponse, AssistantThread, SearchResponse,
-        SearchResult,
+        AssistantMessage, AssistantMeta, AssistantPromptResponse, AssistantThread,
+        ImageSearchResponse, ImageSearchResult, SearchResponse, SearchResult,
     };
     use serde_json::json;
     use std::sync::Arc;
@@ -5707,6 +5863,32 @@ mod tests {
             output,
             "title,url,snippet\n\"Rust, \"\"The Language\"\"\",\"https://example.com/a,b\",\"line 1\nline 2\"\n"
         );
+    }
+
+    #[test]
+    fn formats_image_outputs() {
+        let response = ImageSearchResponse {
+            data: vec![ImageSearchResult {
+                rank: Some(1),
+                title: "Rust logo".to_string(),
+                image_url: "https://example.com/rust.png".to_string(),
+                thumbnail_url: "https://kagiproxy.com/rust-thumb.png".to_string(),
+                source_url: Some("https://example.com/page".to_string()),
+            }],
+        };
+
+        let pretty = format_image_pretty_response(&response, false);
+        assert!(pretty.contains("1. Rust logo"));
+        assert!(pretty.contains("image: https://example.com/rust.png"));
+        assert!(pretty.contains("source: https://example.com/page"));
+
+        let markdown = format_image_markdown_response(&response);
+        assert!(markdown.contains("![Rust logo](https://kagiproxy.com/rust-thumb.png)"));
+        assert!(markdown.contains("Image: <https://example.com/rust.png>"));
+
+        let csv = format_image_csv_response(&response);
+        assert!(csv.starts_with("title,image_url,thumbnail_url,source_url"));
+        assert!(csv.contains("Rust logo,https://example.com/rust.png"));
     }
 
     #[test]

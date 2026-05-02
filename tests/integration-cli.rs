@@ -820,6 +820,44 @@ fn search_command_falls_back_to_session_when_api_is_rate_limited() {
 }
 
 #[test]
+fn images_command_returns_json_from_mock_session_endpoint() {
+    let server = MockServer::start();
+    let _images = server.mock(|when, then| {
+        when.method(GET)
+            .path("/images")
+            .query_param("q", "rust logo")
+            .header("cookie", "kagi_session=test-session");
+        then.status(200).header("content-type", "text/html").body(
+            r#"
+            <html><body>
+              <a href="https://www.rust-lang.org/"
+                 data-image-url="https://static.rust-lang.org/logos/rust-logo-512x512.png">
+                <img src="https://kagiproxy.com/rust-logo-thumb.png" alt="Rust logo">
+              </a>
+            </body></html>
+            "#,
+        );
+    });
+
+    let tempdir = TempDir::new().expect("tempdir");
+    let env = session_env(&server);
+    let output = run_kagi(
+        &["images", "rust logo", "--format", "json"],
+        &env_refs(&env),
+        tempdir.path(),
+    );
+
+    assert_success(&output);
+    let body: Value = serde_json::from_slice(&output.stdout).expect("json output should parse");
+    assert_eq!(body["data"][0]["title"], "Rust logo");
+    assert_eq!(
+        body["data"][0]["image_url"],
+        "https://static.rust-lang.org/logos/rust-logo-512x512.png"
+    );
+    assert_eq!(body["data"][0]["source_url"], "https://www.rust-lang.org/");
+}
+
+#[test]
 fn search_lens_name_resolves_to_current_position() {
     let server = MockServer::start();
     let lenses = server.mock(|when, then| {

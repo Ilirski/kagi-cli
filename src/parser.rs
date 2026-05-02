@@ -13,8 +13,8 @@ use crate::error::KagiError;
 use crate::types::AssistantThreadSummary;
 use crate::types::{
     AssistantModelCatalog, AssistantModelOption, AssistantProfileDetails, AssistantProfileSummary,
-    CustomBangDetails, CustomBangSummary, LensDetails, LensSummary, NewsSearchCluster,
-    NewsSearchResult, RedirectRuleDetails, RedirectRuleSummary, SearchResult,
+    CustomBangDetails, CustomBangSummary, ImageSearchResult, LensDetails, LensSummary,
+    NewsSearchCluster, NewsSearchResult, RedirectRuleDetails, RedirectRuleSummary, SearchResult,
 };
 
 /// Parse Kagi search results from HTML.
@@ -170,6 +170,75 @@ fn extract_news_item(
         paywall,
         image_url,
     })
+}
+
+/// Parse Kagi Images results from HTML.
+///
+/// The image page is an authenticated web-product endpoint rather than a public JSON API.
+/// This parser keys off image elements and nearby metadata so minor markup changes do not
+/// immediately break extraction.
+pub fn parse_image_results(html: &str) -> Result<Vec<ImageSearchResult>, KagiError> {
+    let document = Html::parse_document(html);
+    let img_selector = selector("img")?;
+
+    let mut results = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+
+    for img in document.select(&img_selector) {
+        let Some(thumbnail_url) = first_attr(
+            &img,
+            &[
+                "src",
+                "data-src",
+                "data-lazy-src",
+                "data-thumbnail",
+                "data-thumb",
+            ],
+        ) else {
+            continue;
+        };
+        if should_skip_image_url(thumbnail_url) {
+            continue;
+        }
+
+        let image_url = nearest_attr(
+            &img,
+            &[
+                "data-image-url",
+                "data-image",
+                "data-full-image",
+                "data-full-src",
+                "data-original",
+            ],
+        )
+        .unwrap_or_else(|| thumbnail_url.to_string());
+
+        let title = first_attr(&img, &["alt", "title"])
+            .map(str::to_string)
+            .or_else(|| nearest_attr(&img, &["aria-label", "title"]))
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let title = if title.is_empty() {
+            "Untitled image".to_string()
+        } else {
+            title
+        };
+
+        if !seen.insert(image_url.clone()) {
+            continue;
+        }
+
+        results.push(ImageSearchResult {
+            rank: Some(results.len() as u32 + 1),
+            title,
+            image_url,
+            thumbnail_url: thumbnail_url.to_string(),
+            source_url: nearest_link_href(&img),
+        });
+    }
+
+    Ok(results)
 }
 
 /// Parses a list of assistant threads from the Kagi settings HTML.
@@ -730,6 +799,55 @@ fn extract_result(
     })
 }
 
+fn first_attr<'a>(element: &'a scraper::ElementRef<'a>, attrs: &[&str]) -> Option<&'a str> {
+    attrs
+        .iter()
+        .find_map(|attr| element.value().attr(attr))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn nearest_attr(element: &scraper::ElementRef<'_>, attrs: &[&str]) -> Option<String> {
+    for node in element.ancestors() {
+        if let Some(ancestor) = scraper::ElementRef::wrap(node)
+            && let Some(value) = first_attr(&ancestor, attrs)
+        {
+            return Some(value.to_string());
+        }
+    }
+
+    None
+}
+
+fn nearest_link_href(element: &scraper::ElementRef<'_>) -> Option<String> {
+    for node in element.ancestors() {
+        if let Some(ancestor) = scraper::ElementRef::wrap(node)
+            && ancestor.value().name() == "a"
+            && let Some(href) = ancestor.value().attr("href").map(str::trim)
+            && !href.is_empty()
+            && !href.starts_with('#')
+            && !href.starts_with("javascript:")
+        {
+            return Some(href.to_string());
+        }
+    }
+
+    None
+}
+
+fn should_skip_image_url(url: &str) -> bool {
+    let trimmed = url.trim();
+    if trimmed.is_empty() || trimmed.starts_with("data:") || trimmed.starts_with("blob:") {
+        return true;
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    lower.contains("favicon")
+        || lower.contains("apple-touch-icon")
+        || lower.ends_with(".svg")
+        || lower.ends_with(".ico")
+}
+
 fn selector(value: &str) -> Result<Selector, KagiError> {
     Selector::parse(value)
         .map_err(|error| KagiError::Parse(format!("failed to parse selector `{value}`: {error:?}")))
@@ -817,8 +935,8 @@ mod tests {
     use super::{
         parse_assistant_model_catalog, parse_assistant_profile_form, parse_assistant_profile_list,
         parse_assistant_thread_list, parse_custom_bang_form, parse_custom_bang_list,
-        parse_lens_form, parse_lens_list, parse_news_search_results, parse_redirect_form,
-        parse_redirect_list, parse_search_results,
+        parse_image_results, parse_lens_form, parse_lens_list, parse_news_search_results,
+        parse_redirect_form, parse_redirect_list, parse_search_results,
     };
     use crate::error::KagiError;
 
@@ -859,6 +977,32 @@ mod tests {
         let html = "<html><body><div>No search results here</div></body></html>";
         let results = parse_search_results(html).expect("parser should succeed");
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn parses_image_results_from_image_cards() {
+        let html = r#"
+        <html><body>
+          <a href="https://example.com/source"
+             data-image-url="https://images.example.com/full.jpg"
+             aria-label="Example image">
+            <img src="https://kagiproxy.com/thumb.jpg" alt="Example thumbnail">
+          </a>
+          <img src="/favicon-32x32.png" alt="icon">
+        </body></html>
+        "#;
+
+        let results = parse_image_results(html).expect("parser should succeed");
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].rank, Some(1));
+        assert_eq!(results[0].title, "Example thumbnail");
+        assert_eq!(results[0].image_url, "https://images.example.com/full.jpg");
+        assert_eq!(results[0].thumbnail_url, "https://kagiproxy.com/thumb.jpg");
+        assert_eq!(
+            results[0].source_url.as_deref(),
+            Some("https://example.com/source")
+        );
     }
 
     #[test]

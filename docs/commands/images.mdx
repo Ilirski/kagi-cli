@@ -1,0 +1,92 @@
+---
+title: "images"
+description: "Complete reference for *kagi* images command - search Kagi Images from the terminal."
+---
+
+# `kagi images`
+
+Search Kagi Images and return structured image results in JSON or human-readable formats.
+
+## Synopsis
+
+```bash
+kagi images [OPTIONS] <QUERY>
+```
+
+## Description
+
+`kagi images` uses Kagi's authenticated `/images?q=...` web-product endpoint. It requires a `KAGI_SESSION_TOKEN`; the public Search API token path is not used for image search.
+
+By default, output is pretty JSON for scripts and agents. Use `--format pretty`, `markdown`, or `csv` for terminal and document workflows.
+
+## Options
+
+### `<QUERY>` (Required)
+
+The image search query.
+
+```bash
+kagi images "rust logo"
+```
+
+### `--format <FORMAT>`
+
+Output format.
+
+Possible values:
+
+- `json` - pretty JSON
+- `compact` - minified JSON
+- `pretty` - terminal-friendly output
+- `markdown` - markdown image list
+- `csv` - CSV table output
+
+### `--no-color`
+
+Disable ANSI colors in `--format pretty`.
+
+### `--limit <N>`
+
+Cap the number of image results printed after parsing the response.
+
+```bash
+kagi images "malaysia architecture" --limit 10
+```
+
+### `--local-cache`
+
+Store and reuse the response in the local cache under `~/.cache/kagi-cli` or `KAGI_CACHE_DIR`.
+
+### `--cache-ttl <SECONDS>`
+
+Override the local cache TTL.
+
+## Output
+
+```json
+{
+  "data": [
+    {
+      "rank": 1,
+      "title": "Rust logo",
+      "image_url": "https://example.com/rust.png",
+      "thumbnail_url": "https://kagiproxy.com/rust-thumb.png",
+      "source_url": "https://example.com/page"
+    }
+  ]
+}
+```
+
+## Examples
+
+```bash
+kagi images "rust logo"
+kagi images "rust logo" --format pretty --limit 5
+kagi images "interior design references" --format markdown > images.md
+kagi images "product photos" --format csv > images.csv
+```
+
+## See Also
+
+- [search](/commands/search) - regular web search
+- [auth](/commands/auth) - configure the required session token

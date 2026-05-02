@@ -15,6 +15,7 @@
 ## Commands
 
 - [search](https://kagi.micr.dev/commands/search): Complete reference for *kagi* search command - syntax, flags, authentication, output formats, and real-world examples.
+- [images](https://kagi.micr.dev/commands/images): Complete reference for *kagi* images command - search Kagi Images from the terminal.
 - [auth](https://kagi.micr.dev/commands/auth): Complete reference for *kagi* auth command - credential management, validation, and configuration.
 - [completion](https://kagi.micr.dev/commands/completion): Complete reference for *kagi* completion command - generate and install shell completion scripts.
 - [summarize](https://kagi.micr.dev/commands/summarize): Complete reference for *kagi* summarize command - summarize URLs and text using subscriber or public API modes.

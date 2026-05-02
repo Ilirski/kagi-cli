@@ -14,6 +14,7 @@ This reference provides a complete mapping of which commands require which authe
 | `search` (base) | Configured base-search preference | Session fallback only when API-first mode is enabled | Defaults to session unless `[auth.preferred_auth] = "api"` |
 | `search --lens` | `KAGI_SESSION_TOKEN` | None | Lens requires session token |
 | `search` with filters | `KAGI_SESSION_TOKEN` | None | Region, time, date, order, verbatim, and personalization filters require session token |
+| `images` | `KAGI_SESSION_TOKEN` | None | Kagi Images web-product endpoint |
 | `auth` | None | None | Interactive TTY wizard; writes config and validates the selected credential |
 | `auth status` | None | None | Reads config only |
 | `auth check` | Primary credential | None | Tests selected token |
@@ -188,6 +189,7 @@ Both `enrich web` and `enrich news` require legacy `KAGI_API_TOKEN`:
 Requires `KAGI_SESSION_TOKEN`:
 
 - ✅ Lens-aware search (`--lens`)
+- ✅ Image search (`images`)
 - ✅ Quick Answer (`quick`)
 - ✅ Session-only search options (`--lens`, `--time`, `--order`, `--verbatim`, personalization flags)
 - ✅ Kagi Assistant prompt and thread commands (`assistant`)
@@ -415,6 +417,7 @@ kagi assistant "prompt"
 | Want to... | Token Needed | Command |
 |------------|--------------|---------|
 | Search generally | Either | `kagi search` |
+| Search images | Session | `kagi images` |
 | Use my lens | Session | `kagi search --lens` |
 | Manage my lenses | Session | `kagi lens` |
 | Quick answer from the web product | Session | `kagi quick` |

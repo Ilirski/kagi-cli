@@ -112,6 +112,9 @@ kagi search --no-personalized "rust release notes"
 
 # Output formats: json (default), toon, pretty, compact, markdown, csv
 kagi search --format markdown "query" > results.md
+
+# Image search
+kagi images --format pretty "rust logo"
 ```
 
 ### kagi quick
@@ -332,7 +335,7 @@ kagi redirect delete '^https://old.example.com/(.*)|https://docs.example.com/$1'
 
 ## Output Formats
 
-`search` and `batch` support `json`, `pretty`, `compact`, `markdown`, and `csv`. `quick` and `assistant` support `json`, `pretty`, `compact`, and `markdown`. Commands like `translate`, `news`, `smallweb`, `fastgpt`, `enrich`, `ask-page`, and `summarize` emit JSON only.
+`search`, `images`, and `batch` support `json`, `pretty`, `compact`, `markdown`, and `csv`. `quick` and `assistant` support `json`, `pretty`, `compact`, and `markdown`. Commands like `translate`, `news`, `smallweb`, `fastgpt`, `enrich`, `ask-page`, and `summarize` emit JSON only.
 
 | Format | Use Case |
 |--------|----------|
@@ -347,6 +350,7 @@ kagi search "query" --format json | jq '.'
 kagi search "query" --format pretty
 kagi search "query" --format markdown > results.md
 kagi search "query" --format csv > results.csv
+kagi images "query" --format markdown > images.md
 ```
 
 ## Shell Completions

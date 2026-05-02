@@ -60,6 +60,22 @@ The News tab vertical returns a different shape -- clusters of articles:
 
 `time_relative` is preserved verbatim from Kagi's page (the News tab does not expose absolute timestamps). Single-item clusters represent ungrouped articles at the top of the results page.
 
+### `kagi images`
+
+```json
+{
+  "data": [
+    {
+      "rank": 1,
+      "title": "Image Title",
+      "image_url": "https://example.com/image.jpg",
+      "thumbnail_url": "https://kagiproxy.com/thumb.jpg",
+      "source_url": "https://example.com/page"
+    }
+  ]
+}
+```
+
 ### `kagi batch`
 
 Default JSON output uses a structured envelope:

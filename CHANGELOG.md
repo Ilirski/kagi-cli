@@ -7,6 +7,10 @@ Before `1.0.0`, breaking changes may still ship in minor releases.
 
 ## [Unreleased]
 
+### Added
+
+- Added `kagi images` for session-backed Kagi Images search through `/images?q=...`, with JSON, compact, pretty, markdown, CSV, local cache, and result limiting support
+
 ## [0.14.2]
 
 ### Fixed

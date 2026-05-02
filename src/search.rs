@@ -10,10 +10,11 @@ use tracing::debug;
 
 use crate::error::KagiError;
 use crate::http::{self, map_transport_error};
-use crate::parser::{parse_news_search_results, parse_search_results};
-use crate::types::{NewsSearchResponse, SearchResponse, SearchResult};
+use crate::parser::{parse_image_results, parse_news_search_results, parse_search_results};
+use crate::types::{ImageSearchResponse, NewsSearchResponse, SearchResponse, SearchResult};
 
 const KAGI_SEARCH_PATH: &str = "/html/search";
+const KAGI_IMAGES_PATH: &str = "/images";
 const KAGI_NEWS_SEARCH_PATH: &str = "/news";
 const KAGI_API_SEARCH_PATH: &str = "/api/v1/search";
 const DEBUG_BODY_PREVIEW_LIMIT: usize = 256;
@@ -36,6 +37,32 @@ pub struct SearchRequest {
     pub order: Option<String>,
     pub verbatim: Option<bool>,
     pub personalized: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+/// Parameters for a Kagi Images request.
+pub struct ImageSearchRequest {
+    pub query: String,
+}
+
+impl ImageSearchRequest {
+    /// Creates a new image search request.
+    pub fn new(query: impl Into<String>) -> Self {
+        Self {
+            query: query.into(),
+        }
+    }
+
+    /// Validates the image search request.
+    pub fn validate(&self) -> Result<(), KagiError> {
+        if self.query.trim().is_empty() {
+            return Err(KagiError::Config(
+                "images query cannot be empty".to_string(),
+            ));
+        }
+
+        Ok(())
+    }
 }
 
 impl SearchRequest {
@@ -594,6 +621,81 @@ fn build_news_search_query_params(request: &NewsSearchRequest) -> Vec<(&'static 
         params.push(("dir", "desc".to_string()));
     }
     params
+}
+
+/// Executes a Kagi Images request using session-token authentication.
+///
+/// # Arguments
+/// * `request` - The image search request.
+/// * `token` - The Kagi session token.
+///
+/// # Returns
+/// An `ImageSearchResponse` with parsed image results.
+///
+/// # Errors
+/// Returns `KagiError::Auth` if the session token is missing or expired,
+/// `KagiError::Network` for transport/server errors, and `KagiError::Parse`
+/// if result parsing fails.
+pub async fn execute_image_search(
+    request: &ImageSearchRequest,
+    token: &str,
+) -> Result<ImageSearchResponse, KagiError> {
+    if token.trim().is_empty() {
+        return Err(KagiError::Auth(
+            "missing Kagi session token (expected KAGI_SESSION_TOKEN)".to_string(),
+        ));
+    }
+
+    request.validate()?;
+
+    let client = build_client()?;
+    let response = client
+        .get(http::kagi_url(KAGI_IMAGES_PATH))
+        .query(&[("q", request.query.trim())])
+        .header(header::COOKIE, format!("kagi_session={token}"))
+        .send()
+        .await
+        .map_err(map_transport_error)?;
+
+    match response.status() {
+        StatusCode::OK => {
+            let body = response.text().await.map_err(|error| {
+                KagiError::Network(format!("failed to read response body: {error}"))
+            })?;
+
+            if looks_unauthenticated(&body) || body.contains("<title>Sign In - Kagi Search</title>")
+            {
+                return Err(KagiError::Auth(
+                    "invalid or expired Kagi session token".to_string(),
+                ));
+            }
+
+            Ok(ImageSearchResponse {
+                data: parse_image_results(&body)?,
+            })
+        }
+        status @ (StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) => {
+            let body = http::read_error_body(response, "images").await;
+            Err(KagiError::Auth(format!(
+                "invalid or expired Kagi session token for images: HTTP {status}{}",
+                http::error_body_suffix(&body)
+            )))
+        }
+        status if status.is_server_error() => {
+            let body = http::read_error_body(response, "images").await;
+            Err(KagiError::Network(format!(
+                "Kagi images server error: HTTP {status}{}",
+                http::error_body_suffix(&body)
+            )))
+        }
+        status => {
+            let body = http::read_error_body(response, "images").await;
+            Err(KagiError::Network(format!(
+                "unexpected Kagi images response status: HTTP {status}{}",
+                http::error_body_suffix(&body)
+            )))
+        }
+    }
 }
 
 fn debug_body_preview(body: &str) -> &str {

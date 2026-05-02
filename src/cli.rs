@@ -303,6 +303,8 @@ pub enum Commands {
     /// - Lens support for scoped searches
     /// - Region, time, date, order, verbatim, and personalization filters
     Search(SearchArgs),
+    /// Search Kagi Images and emit structured JSON
+    Images(ImageSearchArgs),
     /// Print the embedded agent skill guide for using kagi-cli
     Agent,
     /// List and load embedded agent skills
@@ -543,6 +545,47 @@ impl SearchArgs {
                 "--order trackers is not supported with --news. Use default, recency, or website"
                     .to_string(),
             );
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Args)]
+/// Arguments for the `images` subcommand.
+pub struct ImageSearchArgs {
+    /// Image search query to send to Kagi
+    #[arg(value_name = "QUERY", required = true)]
+    pub query: String,
+
+    /// Output format
+    #[arg(long, value_name = "FORMAT", default_value_t = OutputFormat::Json)]
+    pub format: OutputFormat,
+
+    /// Disable colored terminal output (only affects pretty format)
+    #[arg(long)]
+    pub no_color: bool,
+
+    /// Locally cache this response
+    #[arg(long)]
+    pub local_cache: bool,
+
+    /// Override local cache TTL in seconds
+    #[arg(long, value_name = "SECONDS")]
+    pub cache_ttl: Option<u64>,
+
+    /// Maximum number of image results to return
+    #[arg(long, value_name = "N")]
+    pub limit: Option<usize>,
+}
+
+impl ImageSearchArgs {
+    /// Validates image search arguments.
+    ///
+    /// # Errors
+    /// Returns an error if `--limit` is set to zero.
+    pub fn validate(&self) -> Result<(), String> {
+        if matches!(self.limit, Some(0)) {
+            return Err("limit must be at least 1".to_string());
         }
         Ok(())
     }
@@ -2173,6 +2216,20 @@ mod tests {
             .expect("search --limit should parse");
         match cli.command.expect("command") {
             Commands::Search(args) => {
+                assert_eq!(args.limit, Some(5));
+                assert!(args.validate().is_ok());
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_images_command() {
+        let cli = Cli::try_parse_from(["kagi", "images", "rust logo", "--limit", "5"])
+            .expect("images command should parse");
+        match cli.command.expect("command") {
+            Commands::Images(args) => {
+                assert_eq!(args.query, "rust logo");
                 assert_eq!(args.limit, Some(5));
                 assert!(args.validate().is_ok());
             }
