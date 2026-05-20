@@ -209,6 +209,7 @@ pub fn parse_image_results(html: &str) -> Result<Vec<ImageSearchResult>, KagiErr
                 "data-full-image",
                 "data-full-src",
                 "data-original",
+                "data-content_url",
             ],
         )
         .unwrap_or_else(|| thumbnail_url.to_string());
@@ -234,7 +235,7 @@ pub fn parse_image_results(html: &str) -> Result<Vec<ImageSearchResult>, KagiErr
             title,
             image_url,
             thumbnail_url: thumbnail_url.to_string(),
-            source_url: nearest_link_href(&img),
+            source_url: nearest_attr(&img, &["data-host_url"]).or_else(|| nearest_link_href(&img)),
         });
     }
 
@@ -988,13 +989,21 @@ mod tests {
              aria-label="Example image">
             <img src="https://kagiproxy.com/thumb.jpg" alt="Example thumbnail">
           </a>
+          <div class="item _0_image_item"
+               data-host_url="https://example.com/page"
+               data-content_url="https://cdn.example.com/original.jpg"
+               data-title="Original image">
+            <a class="_0_img_link_el" href="https://p.kagi.com/proxy/original.jpg">
+              <img src="https://p.kagi.com/proxy/thumb.jpg" alt="Original image">
+            </a>
+          </div>
           <img src="/favicon-32x32.png" alt="icon">
         </body></html>
         "#;
 
         let results = parse_image_results(html).expect("parser should succeed");
 
-        assert_eq!(results.len(), 1);
+        assert_eq!(results.len(), 2);
         assert_eq!(results[0].rank, Some(1));
         assert_eq!(results[0].title, "Example thumbnail");
         assert_eq!(results[0].image_url, "https://images.example.com/full.jpg");
@@ -1002,6 +1011,15 @@ mod tests {
         assert_eq!(
             results[0].source_url.as_deref(),
             Some("https://example.com/source")
+        );
+        assert_eq!(results[1].image_url, "https://cdn.example.com/original.jpg");
+        assert_eq!(
+            results[1].thumbnail_url,
+            "https://p.kagi.com/proxy/thumb.jpg"
+        );
+        assert_eq!(
+            results[1].source_url.as_deref(),
+            Some("https://example.com/page")
         );
     }
 
