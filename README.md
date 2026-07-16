@@ -33,6 +33,10 @@ if you already use Kagi and want to access it from scripts, shell workflows, or 
 - use one CLI for search, quick answers, assistant, translate, summarization, `news`, and `smallweb`
 - add `KAGI_API_KEY` for current `/api/v1` commands, or `KAGI_API_TOKEN` for legacy `/api/v0` commands
 
+## wtf
+
+**w**hy **t**he **f**ork: upstream `kagi-cli` has no image search. this fork adds `kagi images` so you can search Kagi Images from the terminal with the same JSON/pretty/compact/markdown/csv output as `kagi search`.
+
 ## quickstart
 
 ### Linux or macOS
