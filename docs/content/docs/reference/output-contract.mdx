@@ -1,0 +1,578 @@
+---
+title: "Output Contract"
+description: "Current output shapes for the kagi CLI, including JSON envelopes, pretty output, and stderr behavior."
+---
+
+# Output Contract
+
+This page documents the current CLI output behavior as implemented in the repo.
+
+## Core Rules
+
+1. Most commands print pretty-formatted JSON to stdout on success.
+2. `kagi search`, `kagi batch`, `kagi quick`, and `kagi assistant` support alternate output via format flags, including `toon` for token-efficient structured context.
+3. Errors are plain text on stderr and exit with status code `1` by default. Use global `--error-format json` or `KAGI_ERROR_FORMAT=json` for a structured stderr envelope.
+4. Output shapes differ by command. There is no single universal response envelope.
+
+## Success Shapes
+
+### `kagi search`
+
+```json
+{
+  "data": [
+    {
+      "t": 0,
+      "rank": 1,
+      "title": "Result Title",
+      "url": "https://example.com",
+      "snippet": "Description...",
+      "published": "2026-03-16T00:00:00Z"
+    }
+  ]
+}
+```
+
+### `kagi search --news`
+
+The News tab vertical returns a different shape -- clusters of articles:
+
+```json
+{
+  "query": "iran",
+  "clusters": [
+    {
+      "items": [
+        {
+          "title": "Headline",
+          "url": "https://www.example.com/article",
+          "source": "example.com",
+          "time_relative": "2 hours ago",
+          "snippet": "Optional snippet text.",
+          "paywall": false,
+          "image_url": "https://img.example/lead.jpg"
+        }
+      ]
+    }
+  ]
+}
+```
+
+`time_relative` is preserved verbatim from Kagi's page (the News tab does not expose absolute timestamps). Single-item clusters represent ungrouped articles at the top of the results page.
+
+### `kagi images`
+
+```json
+{
+  "data": [
+    {
+      "rank": 1,
+      "title": "Image Title",
+      "image_url": "https://example.com/image.jpg",
+      "thumbnail_url": "https://kagiproxy.com/thumb.jpg",
+      "source_url": "https://example.com/page"
+    }
+  ]
+}
+```
+
+### `kagi batch`
+
+Default JSON output uses a structured envelope:
+
+```json
+{
+  "queries": ["rust", "go"],
+  "results": [
+    {
+      "data": [
+        {
+          "t": 0,
+          "rank": 1,
+          "title": "Result Title",
+          "url": "https://example.com",
+          "snippet": "Description...",
+          "published": "2026-03-16T00:00:00Z"
+        }
+      ]
+    }
+  ]
+}
+```
+
+### `kagi summarize`
+
+Public API mode:
+
+```json
+{
+  "meta": {
+    "id": "1",
+    "node": "us-east",
+    "ms": 10
+  },
+  "data": {
+    "output": "summary text",
+    "tokens": 42
+  }
+}
+```
+
+Subscriber mode:
+
+```json
+{
+  "meta": {
+    "version": "202603091651.stage.c128588",
+    "trace": "abc123"
+  },
+  "data": {
+    "thread_id": "thread-1",
+    "state": "done",
+    "output": "summary text",
+    "markdown": "summary text"
+  }
+}
+```
+
+### `kagi extract`
+
+Single-URL extract prints markdown by default, or the full Extract API envelope with `--format json`:
+
+```json
+{
+  "meta": {
+    "trace": "trace-1",
+    "node": "test",
+    "ms": 12
+  },
+  "data": [
+    {
+      "url": "https://example.com/article",
+      "markdown": "# Article\n\nExtracted content.",
+      "links": []
+    }
+  ]
+}
+```
+
+`kagi extract --filter` prints compact JSONL, one record per stdin URL:
+
+```jsonl
+{"url":"https://example.com/article","ok":true,"response":{"meta":{"trace":"trace-1","node":"test","ms":12},"data":[{"url":"https://example.com/article","markdown":"# Article","links":[]}]}}
+{"url":"http://example.com/bad","ok":false,"error":{"code":"configuration_error","category":"configuration","retryable":false,"message":"configuration error: extract URL must use the https scheme","suggested_commands":[],"docs_url":"https://kagi.micr.dev/reference/error-reference"}}
+```
+
+### `kagi news`
+
+```json
+{
+  "latest_batch": {
+    "id": "batch-123",
+    "created_at": "2026-03-16T00:00:00Z"
+  },
+  "category": {
+    "category_id": "tech",
+    "category_name": "Technology"
+  },
+  "stories": [],
+  "total_stories": 20,
+  "domains": [],
+  "read_count": 1234
+}
+```
+
+`kagi news --list-categories` and `kagi news --chaos` return different JSON shapes with category metadata or chaos metadata.
+
+### `kagi assistant`
+
+```json
+{
+  "meta": {
+    "version": "202603091651.stage.c128588",
+    "trace": "trace-123"
+  },
+  "thread": {
+    "id": "thread-1",
+    "title": "Greeting",
+    "created_at": "2026-03-16T06:19:07Z"
+  },
+  "message": {
+    "id": "msg-1",
+    "thread_id": "thread-1",
+    "created_at": "2026-03-16T06:19:07Z",
+    "state": "done",
+    "prompt": "Hello",
+    "markdown": "Hi",
+    "usage": {
+      "prompt_tokens": 4314,
+      "completion_tokens": 2,
+      "total_tokens": 4316,
+      "cost_usd": 0.006192
+    }
+  }
+}
+```
+
+`kagi assistant --stream` writes incremental markdown deltas to stdout and flushes after each update. `kagi assistant --stream --stream-output json` writes the same stream as newline-delimited compact JSON events with an `md_delta` field plus the current `meta`, `thread`, and `message` snapshot.
+
+The final stream event and completed messages returned by `kagi assistant thread get` include `message.usage` when Kagi supplies token and cost data. `prompt_tokens` maps to Kagi's input tokens, `completion_tokens` maps to output tokens, and `total_tokens` is their sum when the thread API does not return a total.
+
+`kagi assistant models` reads the account-scoped Assistant catalog and returns every base model independently of saved custom assistants:
+
+```json
+{
+  "models": [
+    {
+      "id": "ki_quick",
+      "label": "Quick"
+    }
+  ],
+  "default": "ki_quick"
+}
+```
+
+`kagi assistant --contract <NAME>` and `kagi assistant --contract-file <PATH>` print only the validated contract JSON. Contract mode supports `--format json` and `--format compact`.
+
+```json
+{
+  "decision": "ship",
+  "rationale": "tests pass",
+  "next_actions": ["open PR"]
+}
+```
+
+### `kagi assistant custom`
+
+`list` returns an array of assistant summaries:
+
+```json
+[
+  {
+    "id": "assistant-1",
+    "name": "Research",
+    "invoke_profile": "research",
+    "model": "gpt-5-4-nano",
+    "bang_trigger": "research",
+    "internet_access": true,
+    "built_in": false,
+    "edit_url": "/assistant/custom-assistants/assistant-1"
+  }
+]
+```
+
+`get`, `create`, and `update` return assistant details:
+
+```json
+{
+  "profile_id": "assistant-1",
+  "name": "Research",
+  "bang_trigger": "research",
+  "internet_access": true,
+  "selected_lens": "",
+  "personalizations": false,
+  "base_model": "gpt-5-4-nano",
+  "custom_instructions": "Focus on changelogs first.",
+  "delete_supported": true
+}
+```
+
+### `kagi lens`
+
+```json
+[
+  {
+    "id": "42",
+    "name": "Rust Docs",
+    "description": "Rust docs only",
+    "enabled": true,
+    "position": 2,
+    "edit_url": "/settings/lenses/edit/42"
+  }
+]
+```
+
+### `kagi bang custom`
+
+```json
+[
+  {
+    "id": "7",
+    "name": "Rust Docs",
+    "trigger": "rustdocs",
+    "shortcut_menu": true,
+    "edit_url": "/settings/custom_bangs/edit/7"
+  }
+]
+```
+
+### `kagi redirect`
+
+```json
+[
+  {
+    "id": "12",
+    "rule": "^gh/(.+)$|https://github.com/$1",
+    "enabled": true,
+    "edit_url": "/rewrite_rules/edit/12"
+  }
+]
+```
+
+### `kagi quick`
+
+```json
+{
+  "meta": {
+    "version": "202603171911.stage.707e740",
+    "trace": "trace-123"
+  },
+  "query": "what is rust",
+  "lens": null,
+  "message": {
+    "id": "msg-1",
+    "thread_id": "thread-1",
+    "created_at": "2026-03-19T00:00:00Z",
+    "state": "done",
+    "prompt": "what is rust",
+    "html": "<p>Rust is a systems programming language.</p>",
+    "markdown": "Rust is a systems programming language."
+  },
+  "references": {
+    "markdown": "[^1]: [Rust](https://www.rust-lang.org/) (26%)",
+    "items": [
+      {
+        "index": 1,
+        "title": "Rust",
+        "domain": "www.rust-lang.org",
+        "url": "https://www.rust-lang.org/",
+        "contribution_pct": 26
+      }
+    ]
+  },
+  "followup_questions": [
+    "Why is Rust memory-safe?"
+  ]
+}
+```
+
+### `kagi translate`
+
+```json
+{
+  "bootstrap": {
+    "method": "reqwest(set-cookie bootstrap)",
+    "authenticated": true
+  },
+  "detected_language": {
+    "iso": "fr",
+    "label": "French"
+  },
+  "translation": {
+    "translation": "Hello everyone",
+    "source_language": "fr",
+    "target_language": "en"
+  },
+  "alternatives": {
+    "elements": []
+  },
+  "text_alignments": {
+    "alignments": []
+  },
+  "translation_suggestions": {
+    "suggestions": []
+  },
+  "word_insights": {
+    "insights": []
+  },
+  "warnings": []
+}
+```
+
+### `kagi ask-page`
+
+```json
+{
+  "meta": {
+    "version": "202603171911.stage.707e740",
+    "trace": "trace-123"
+  },
+  "source": {
+    "url": "https://rust-lang.org/",
+    "question": "What is this page about?"
+  },
+  "thread": {
+    "id": "thread-1",
+    "title": "Rust Programming Language Website",
+    "created_at": "2026-03-19T17:58:59Z"
+  },
+  "message": {
+    "id": "msg-1",
+    "thread_id": "thread-1",
+    "state": "done",
+    "prompt": "https://rust-lang.org/\nWhat is this page about?",
+    "markdown": "This page is about the Rust programming language."
+  }
+}
+```
+
+### `kagi fastgpt`
+
+```json
+{
+  "meta": {
+    "id": "1",
+    "node": "us-east",
+    "ms": 10
+  },
+  "data": {
+    "output": "answer text",
+    "tokens": 12,
+    "references": []
+  }
+}
+```
+
+### `kagi enrich`
+
+```json
+{
+  "meta": {
+    "id": "1",
+    "node": "us-east",
+    "ms": 10
+  },
+  "data": [
+    {
+      "title": "Result Title",
+      "url": "https://example.com",
+      "snippet": "Description...",
+      "published": "2026-03-16T00:00:00Z"
+    }
+  ]
+}
+```
+
+### `kagi smallweb`
+
+```json
+{
+  "xml": "<?xml version=\"1.0\"?><rss>...</rss>"
+}
+```
+
+## Pretty Search Output
+
+`kagi search --format pretty` renders results like this:
+
+```text
+1. Result Title
+   https://example.com
+
+   Description...
+```
+
+If the result set is empty, the CLI prints:
+
+```text
+No results found.
+```
+
+## Pretty Quick Output
+
+`kagi quick --format pretty` renders:
+
+```text
+Quick Answer
+
+Rust is a systems programming language...
+
+References
+
+1. Learn (35%)
+   https://www.rust-lang.org/learn
+```
+
+## Pretty Assistant Output
+
+`kagi assistant --format pretty` renders:
+
+```text
+Thread: thread-1
+Message: msg-1
+
+Rust 1.86 added...
+```
+
+## Error Behavior
+
+Errors are plain text on stderr. Typical examples:
+
+```text
+configuration error: missing credentials: search was not sent. Set KAGI_API_KEY or KAGI_SESSION_TOKEN, or run `kagi auth set --api-key <key>` or `kagi auth set --session-token <token>`
+Auth error: invalid or expired Kagi session token
+Network error: request to Kagi timed out
+```
+
+Opt into JSON errors with global `--error-format json` or `KAGI_ERROR_FORMAT=json`. The envelope is compact JSON on stderr:
+
+```json
+{
+  "code": "missing_credentials",
+  "category": "configuration",
+  "retryable": false,
+  "message": "configuration error: missing credentials: search was not sent...",
+  "required_auth": "KAGI_API_KEY or KAGI_SESSION_TOKEN",
+  "suggested_commands": ["kagi auth status", "kagi auth set --api-key <key>", "kagi auth set --session-token <token>"],
+  "docs_url": "https://kagi.micr.dev/reference/error-reference"
+}
+```
+
+## jq Examples
+
+```bash
+# Search URLs
+kagi search "rust" | jq -r '.data[].url'
+
+# FastGPT answer text
+kagi fastgpt "What is Rust?" | jq -r '.data.output'
+
+# Assistant markdown reply
+kagi assistant "Hello" | jq -r '.message.markdown'
+
+# Quick Answer markdown reply
+kagi quick "what is rust" | jq -r '.message.markdown'
+
+# Quick Answer references
+kagi quick "what is rust" | jq -r '.references.items[].url'
+
+# Translate text
+kagi translate "Bonjour tout le monde" | jq -r '.translation.translation'
+
+# Ask-page markdown reply
+kagi ask-page https://rust-lang.org/ "What is this page about?" | jq -r '.message.markdown'
+
+# Assistant thread ids
+kagi assistant thread list | jq -r '.threads[].id'
+
+# Assistant thread export markdown
+kagi assistant thread export "$THREAD_ID"
+
+# Assistant profile names
+kagi assistant custom list | jq -r '.[].name'
+
+# Lens names
+kagi lens list | jq -r '.[].name'
+
+# Bang triggers
+kagi bang custom list | jq -r '.[].trigger'
+
+# Enabled redirect rules
+kagi redirect list | jq -r '.[] | select(.enabled) | .rule'
+
+# Subscriber summary text
+kagi summarize --subscriber --url https://example.com | jq -r '.data.output'
+
+# Small Web raw feed
+kagi smallweb | jq -r '.xml'
+```

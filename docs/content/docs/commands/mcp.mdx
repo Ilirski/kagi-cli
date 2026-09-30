@@ -1,0 +1,196 @@
+---
+title: "mcp"
+description: "Run kagi-cli as a stdio Model Context Protocol server."
+---
+
+# `kagi mcp`
+
+Run a stdio MCP server that exposes Kagi tools for agents. The server
+auto-negotiates the wire protocol per request: it speaks the stateless draft
+`2026-07-28` protocol with per-request metadata, and also answers the stable
+MCP specification's `initialize` handshake, `ping`, `tools/list`, and
+`tools/call` for clients that do not support the draft.
+
+## Synopsis
+
+```bash
+kagi mcp [--default-output json|toon|pretty|compact|markdown|csv] [--enable-mutating-tools]
+kagi mcp install [--target CLIENT]... [--all] [--dry-run]
+kagi mcp setup [--target CLIENT]... [--all] [--dry-run]
+kagi mcp auth [--target CLIENT]... [--all] [--dry-run]
+```
+
+## Install into an AI agent
+
+`kagi mcp install`, `kagi mcp setup`, and `kagi mcp auth` are aliases for the same setup flow. On a TTY, the command asks which agents to configure. In scripts, pass one or more `--target` values:
+
+```bash
+kagi mcp install --target codex --target cursor
+kagi mcp install --all
+kagi mcp install --target opencode --dry-run
+```
+
+Supported targets:
+
+| Target | Setup method |
+| --- | --- |
+| `claude-code` | Runs `claude mcp add --scope user kagi-mcp -- <kagi> mcp` when available, otherwise writes `~/.claude.json` |
+| `claude-desktop` | Writes the documented Claude Desktop JSON config on macOS or Windows |
+| `codex` | Adds the `kagi-mcp` server under `mcp_servers` in `~/.codex/config.toml` |
+| `cursor` | Writes `~/.cursor/mcp.json` under `mcpServers` |
+| `vs-code` | Writes the VS Code user `mcp.json` under `servers` |
+| `windsurf` | Writes `~/.codeium/mcp_config.json` under `mcpServers` |
+| `gemini` | Writes `~/.gemini/settings.json` under `mcpServers` |
+| `opencode` | Parses JSONC and writes `~/.config/opencode/opencode.json` under `mcp` |
+| `cline` | Writes `~/.cline/mcp.json` under `mcpServers` |
+| `roo-code` | Writes Roo Code extension MCP settings under VS Code-compatible global storage |
+| `droid` | Writes `~/.factory/mcp.json` under `mcpServers` |
+| `antigravity` | Writes `~/.gemini/antigravity-cli/mcp_config.json` under `mcpServers` |
+
+Use `--server-name <NAME>` to choose a different MCP server key, or `--kagi-path <PATH>` if the client needs a specific executable path. By default, setup uses the currently running `kagi` executable. The installed entry runs plain `kagi mcp`, which auto-negotiates the protocol with each client.
+
+Setup merges into existing config and preserves other MCP servers. It updates only the selected server key, which defaults to `kagi-mcp`.
+
+## Use with Codex
+
+`kagi mcp` is a stdio server. You normally do not run it in a separate terminal; your MCP client launches it when it needs Kagi tools.
+
+Start by making sure `kagi` works from your shell:
+
+```bash
+kagi auth status
+kagi auth check
+```
+
+Then add it to Codex:
+
+```bash
+codex mcp add kagi-mcp -- "$(command -v kagi)" mcp
+```
+
+Check the saved entry:
+
+```bash
+codex mcp get kagi-mcp
+```
+
+You should see `command` pointing at the `kagi` binary and `args` set to `mcp`.
+
+If Codex will not run from the directory that contains your `./.kagi.toml`, pass credentials through the MCP entry instead:
+
+```bash
+codex mcp add kagi-mcp \
+  --env KAGI_SESSION_TOKEN="$KAGI_SESSION_TOKEN" \
+  -- "$(command -v kagi)" mcp
+```
+
+Use only the environment values you need. `KAGI_SESSION_TOKEN` unlocks subscriber-backed search, Quick Answer, and news search. Add `--env KAGI_API_KEY="$KAGI_API_KEY"` when you want current `/api/v1` Search or Extract. Add `--env KAGI_API_TOKEN="$KAGI_API_TOKEN"` when you want the legacy public summarizer.
+
+If you previously used the separate `kagi-mcp` wrapper, replace it with the native CLI server:
+
+```bash
+codex mcp remove kagi-mcp
+codex mcp add kagi-mcp -- "$(command -v kagi)" mcp
+```
+
+Restart Codex after changing MCP entries so the tool list is rediscovered.
+
+The server auto-negotiates the protocol per request with no configuration.
+Requests whose `params._meta` carries
+`io.modelcontextprotocol/protocolVersion` speak the draft `2026-07-28`
+protocol: every request, including `server/discover`, sends the protocol
+version, client identity, and client capabilities in `params._meta`. Draft
+clients can call `server/discover` first with a preferred version and retry
+with a supported version if the server returns an unsupported-version error:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "server/discover",
+  "params": {
+    "_meta": {
+      "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+      "io.modelcontextprotocol/clientInfo": {
+        "name": "my-agent",
+        "version": "1.0.0"
+      },
+      "io.modelcontextprotocol/clientCapabilities": {}
+    }
+  }
+}
+```
+
+Requests without the draft `_meta` key — including `initialize` — speak the
+stable MCP specification. The server answers `initialize` by echoing the
+requested version when it is one of `2025-11-25`, `2025-06-18`,
+`2025-03-26`, `2024-11-05`, or `2024-10-07`, and otherwise falls back to
+`2025-11-25`. It also serves `ping`, `tools/list`, and `tools/call`. The
+stable spec permits `_meta` for features such as `progressToken`, so
+discrimination keys on the namespaced draft protocol-version field rather
+than `_meta` presence. Draft-only methods such as `server/discover` return a
+`-32601` method-not-found error when they arrive without draft metadata.
+
+Draft discovery and tool-list responses include `resultType`, `ttlMs`, and
+`cacheScope` so clients can cache stable metadata. Tool calls return
+`structuredContent` when the selected output format is JSON. Kagi API and
+validation failures are returned as tool results with `isError: true`, which
+lets an agent inspect and correct the call. Unknown tools and malformed MCP
+requests remain JSON-RPC errors.
+
+To use a named profile from `./.kagi.toml`, put `--profile` after `mcp`:
+
+```bash
+codex mcp add kagi-work -- "$(command -v kagi)" mcp --profile work
+```
+
+Use TOON by default for token-efficient agent context:
+
+```bash
+codex mcp add kagi-mcp -- "$(command -v kagi)" mcp --default-output toon
+```
+
+Expose account and local-state mutation tools only when you want an agent to manage settings:
+
+```bash
+codex mcp add kagi-admin -- "$(command -v kagi)" mcp --enable-mutating-tools
+```
+
+## Tools
+
+Default read/query tools:
+
+- `kagi_search` and `kagi_batch_search` - web search, News-tab search, filters, lenses, snaps, dates, ordering, templates, follow summaries, cache options, and output formats.
+- `kagi_summarize` - public API or subscriber summarizer with engine, summary type, target language, length, cache, and local cache options.
+- `kagi_extract` - Extract API markdown, JSON, compact JSON, or TOON output.
+- `kagi_quick` - Quick Answer with lens, cache, and output options.
+- `kagi_news`, `kagi_news_categories`, `kagi_news_chaos`, and `kagi_news_filter_presets` - public Kagi News feed and metadata.
+- `kagi_news_search` - subscriber News-tab search clusters.
+- `kagi_assistant_models`, `kagi_assistant_thread_list`, `kagi_assistant_thread_get`, and `kagi_assistant_thread_export` - Assistant model and thread reads.
+- `kagi_assistant_custom_list` and `kagi_assistant_custom_get` - read saved assistant definitions.
+- `kagi_translate` - Kagi Translate text mode.
+- `kagi_fastgpt` - FastGPT API answers.
+- `kagi_enrich_web` and `kagi_enrich_news` - enrichment indexes.
+- `kagi_smallweb` - Small Web feed.
+- `kagi_lens_list`, `kagi_lens_get`, `kagi_custom_bang_list`, `kagi_custom_bang_get`, `kagi_redirect_list`, and `kagi_redirect_get` - read account search settings.
+- `kagi_auth_status` and `kagi_auth_check` - inspect and validate selected credentials.
+- `kagi_history_list`, `kagi_history_stats`, and `kagi_site_pref_list` - inspect local CLI state.
+
+Tools exposed only with `--enable-mutating-tools`:
+
+- `kagi_assistant` and `kagi_ask_page` - prompt Assistant in a way that creates or extends conversations.
+- `kagi_assistant_thread_delete`
+- `kagi_assistant_custom_create`, `kagi_assistant_custom_update`, `kagi_assistant_custom_delete`
+- `kagi_lens_create`, `kagi_lens_update`, `kagi_lens_delete`, `kagi_lens_enable`, `kagi_lens_disable`
+- `kagi_custom_bang_create`, `kagi_custom_bang_update`, `kagi_custom_bang_delete`
+- `kagi_redirect_create`, `kagi_redirect_update`, `kagi_redirect_delete`, `kagi_redirect_enable`, `kagi_redirect_disable`
+- `kagi_site_pref_set`, `kagi_site_pref_remove`
+- `kagi_cli` - run any non-`mcp` `kagi` command by passing an `args` array and optional `stdin`. Use this for exact CLI parity when a workflow is not modeled as a structured MCP tool.
+
+The server reads one MCP request or notification per stdin line and writes one
+MCP response per stdout line. It keeps the implementation dependency-light and
+easy to supervise from agent runners.
+
+## Authentication
+
+The server uses the same credentials as the CLI. Use `--profile <NAME>` to select a profile before `mcp`.

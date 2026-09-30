@@ -43,6 +43,17 @@ pub enum ErrorOutputFormat {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+/// Output format for account usage reports.
+pub enum UsageOutputFormat {
+    /// Pretty-printed JSON for scripts and inspection.
+    Json,
+    /// Minified JSON for compact automation output.
+    Compact,
+    /// Human-readable terminal summary.
+    Pretty,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 /// AI agent or harness that can be configured to launch `kagi mcp`.
 pub enum McpClient {
     /// Claude Code CLI, configured through `claude mcp add`
@@ -258,14 +269,14 @@ Features:
 - Full Kagi API coverage with session token support
 
 Agent usage:
-    kagi skills get kagi
+    kagi skills get kagi-usage
 
     Skills ship with the CLI and are always version-matched. They include
     workflow patterns, credential guidance, and copy-paste examples. Prefer
     this over guessing commands from flag docs alone.
 
     skills [list]            List available skills
-    skills get kagi          Core CLI usage guide
+    skills get kagi-usage    Core CLI usage guide
     skills get <name>        Load a specialized skill
     skills path [name]       Print the embedded skill locator",
     propagate_version = true
@@ -311,6 +322,11 @@ pub enum Commands {
     Skills(SkillsCommand),
     /// Launch the auth setup wizard or use credential management subcommands
     Auth(AuthCommand),
+    /// Inspect account plan, AI allowance, renewal, and calendar-month usage
+    #[command(visible_alias = "billing")]
+    Usage(UsageArgs),
+    /// Search and read Kagi Mail
+    Mail(crate::mail::MailCommand),
     /// Summarize a URL or text with Kagi's public API or subscriber web Summarizer
     Summarize(SummarizeArgs),
     /// Extract a page's full content as markdown through Kagi's Extract API
@@ -695,6 +711,14 @@ impl BatchSearchArgs {
 }
 
 #[derive(Debug, Args)]
+/// Arguments for the `usage` subcommand.
+pub struct UsageArgs {
+    /// Output format
+    #[arg(long, value_name = "FORMAT", value_enum, default_value = "json")]
+    pub format: UsageOutputFormat,
+}
+
+#[derive(Debug, Args)]
 /// Arguments for the `auth` command group.
 pub struct AuthCommand {
     #[command(subcommand)]
@@ -891,6 +915,20 @@ pub struct FastGptArgs {
     #[arg(long, value_name = "SECONDS")]
     pub cache_ttl: Option<u64>,
 }
+impl FastGptArgs {
+    /// Validates fastgpt arguments.
+    ///
+    /// # Errors
+    /// Returns an error when web search is explicitly disabled, which the
+    /// upstream FastGPT API does not support.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.web_search == Some(false) {
+            return Err("fastgpt --web-search false is not supported by the upstream FastGPT API, which requires web search grounding. Omit --web-search or pass --web-search true".to_string());
+        }
+
+        Ok(())
+    }
+}
 
 #[derive(Debug, Args)]
 /// Arguments for the `news` subcommand.
@@ -1057,7 +1095,7 @@ pub struct AssistantArgs {
 pub enum AssistantSubcommand {
     /// Manage Assistant threads
     Thread(AssistantThreadArgs),
-    /// List Assistant base-model slugs available to custom assistants
+    /// List every Assistant base model available to the current account
     Models,
     /// Manage custom assistants
     Custom(AssistantCustomArgs),
@@ -1941,8 +1979,8 @@ pub struct RedirectUpdateArgs {
 #[cfg(test)]
 mod tests {
     use super::{
-        Cli, Commands, NewsArgs, NewsFilterMode, NewsFilterScope, OutputFormat, SearchArgs,
-        SearchOrder, SearchTime, SummarizeArgs,
+        Cli, Commands, FastGptArgs, NewsArgs, NewsFilterMode, NewsFilterScope, OutputFormat,
+        SearchArgs, SearchOrder, SearchTime, SummarizeArgs,
     };
     use clap::Parser;
 
@@ -2095,6 +2133,31 @@ mod tests {
             .expect_err("summarize should require url or text input");
         assert!(error.contains("exactly one of --url or --text"));
     }
+    #[test]
+    fn rejects_fastgpt_disabled_web_search() {
+        let args = FastGptArgs {
+            query: "What is the capital of Australia?".to_string(),
+            cache: None,
+            web_search: Some(false),
+            local_cache: false,
+            cache_ttl: None,
+        };
+        let error = args
+            .validate()
+            .expect_err("web_search false should be rejected");
+        assert!(error.contains("not supported"));
+
+        for web_search in [None, Some(true)] {
+            let args = FastGptArgs {
+                query: "What is the capital of Australia?".to_string(),
+                cache: None,
+                web_search,
+                local_cache: false,
+                cache_ttl: None,
+            };
+            assert!(args.validate().is_ok());
+        }
+    }
 
     #[test]
     fn parses_product_workflow_commands() {
@@ -2148,6 +2211,45 @@ mod tests {
             Commands::Lens(command) => match command.command {
                 super::LensSubcommand::Enable(target) => assert_eq!(target.target, "Reddit"),
                 other => panic!("unexpected lens subcommand: {other:?}"),
+            },
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_assistant_custom_create_command() {
+        let cli = Cli::try_parse_from([
+            "kagi",
+            "assistant",
+            "custom",
+            "create",
+            "Release Notes",
+            "--model",
+            "gpt-5-4-nano",
+            "--web-access",
+            "--lens",
+            "2",
+            "--instructions",
+            "Focus on release diffs and migration notes.",
+        ])
+        .expect("assistant custom create should parse");
+
+        match cli.command.expect("command") {
+            Commands::Assistant(args) => match args.command.expect("subcommand") {
+                super::AssistantSubcommand::Custom(custom) => match custom.command {
+                    super::AssistantCustomSubcommand::Create(create) => {
+                        assert_eq!(create.name, "Release Notes");
+                        assert_eq!(create.model.as_deref(), Some("gpt-5-4-nano"));
+                        assert!(create.web_access);
+                        assert_eq!(create.lens.as_deref(), Some("2"));
+                        assert_eq!(
+                            create.instructions.as_deref(),
+                            Some("Focus on release diffs and migration notes.")
+                        );
+                    }
+                    other => panic!("unexpected assistant custom subcommand: {other:?}"),
+                },
+                other => panic!("unexpected assistant subcommand: {other:?}"),
             },
             other => panic!("unexpected command: {other:?}"),
         }

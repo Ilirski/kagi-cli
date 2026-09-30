@@ -6,6 +6,9 @@ mod cli;
 mod error;
 mod http;
 mod local;
+mod mail;
+#[path = "mail-auth.rs"]
+mod mail_auth;
 mod mcp_install;
 mod parser;
 mod quick;
@@ -14,6 +17,7 @@ mod search;
 #[path = "test-support.rs"]
 mod test_support;
 mod types;
+mod usage;
 
 use clap::{CommandFactory, Parser};
 use clap_complete::{generate, shells};
@@ -46,7 +50,7 @@ use crate::cli::{
     ErrorOutputFormat, ExtractOutputFormat, HistorySubcommand, McpArgs, NewsFilterMode,
     NewsFilterScope, NotifyArgs, OutputFormat, QuickOutputFormat, SearchArgs, SearchOrder,
     SearchTime, SitePrefMode, SitePrefSubcommand, SkillsCommand, SkillsSubcommand, TranslateArgs,
-    WatchArgs,
+    UsageOutputFormat, WatchArgs,
 };
 use crate::error::KagiError;
 use crate::quick::{execute_quick, format_quick_markdown, format_quick_pretty};
@@ -167,7 +171,9 @@ struct ErrorEnvelope {
 fn error_envelope(error: &KagiError) -> ErrorEnvelope {
     let (code, category, retryable, detail) = match error {
         KagiError::Network(message) => ("network_error", "network", true, message.as_str()),
-        KagiError::Auth(message) => ("authentication_error", "auth", false, message.as_str()),
+        KagiError::Auth(message) | KagiError::MailAuth(message) => {
+            ("authentication_error", "auth", false, message.as_str())
+        }
         KagiError::Parse(message) => ("parse_error", "parse", false, message.as_str()),
         KagiError::Config(message) if message.starts_with("assistant contract") => {
             ("contract_error", "contract", false, message.as_str())
@@ -186,7 +192,10 @@ fn error_envelope(error: &KagiError) -> ErrorEnvelope {
         ),
         KagiError::Batch(message) => ("batch_error", "batch", false, message.as_str()),
     };
-    let required_auth = required_auth_for_message(detail);
+    let required_auth = match error {
+        KagiError::MailAuth(_) => Some("KAGI_MAIL_ACCESS_TOKEN"),
+        _ => required_auth_for_message(detail),
+    };
 
     ErrorEnvelope {
         code,
@@ -201,7 +210,9 @@ fn error_envelope(error: &KagiError) -> ErrorEnvelope {
 }
 
 fn required_auth_for_message(message: &str) -> Option<&'static str> {
-    if message.contains("missing credentials") {
+    if message.contains("KAGI_MAIL_ACCESS_TOKEN") {
+        Some("KAGI_MAIL_ACCESS_TOKEN")
+    } else if message.contains("missing credentials") {
         Some("KAGI_API_KEY or KAGI_SESSION_TOKEN")
     } else if message.contains("KAGI_API_KEY") {
         Some("KAGI_API_KEY")
@@ -219,6 +230,7 @@ fn suggested_commands_for_error(
     required_auth: Option<&'static str>,
 ) -> Vec<&'static str> {
     match required_auth {
+        Some("KAGI_MAIL_ACCESS_TOKEN") => vec!["kagi mail status", "kagi mail login"],
         Some("KAGI_API_KEY") => vec![
             "kagi auth status",
             "kagi auth set --api-key <key>",
@@ -280,9 +292,12 @@ async fn run() -> Result<(), KagiError> {
     let cli = Cli::parse();
 
     if cli.generate_completion.is_some() && cli.command.is_some() {
-        return Err(KagiError::Config(
-            "completion was not generated because --generate-completion cannot be used with a command. Run `kagi --generate-completion <shell>` by itself".to_string(),
-        ));
+        Cli::command()
+            .error(
+                clap::error::ErrorKind::ArgumentConflict,
+                "completion was not generated because --generate-completion cannot be used with a command. Run `kagi --generate-completion <shell>` by itself",
+            )
+            .exit();
     }
 
     if let Some(shell) = cli.generate_completion {
@@ -377,6 +392,19 @@ async fn run() -> Result<(), KagiError> {
             AuthSubcommand::Check => run_auth_check(profile.as_deref()).await,
             AuthSubcommand::Set(args) => run_auth_set(args, profile.as_deref()),
         },
+        Commands::Usage(args) => {
+            let token = resolve_session_token(profile.as_deref())?;
+            let report = usage::execute_usage(&token).await?;
+            match args.format {
+                UsageOutputFormat::Json => print_json(&report),
+                UsageOutputFormat::Compact => print_compact_json(&report),
+                UsageOutputFormat::Pretty => {
+                    println!("{}", usage::format_pretty(&report));
+                    Ok(())
+                }
+            }
+        }
+        Commands::Mail(args) => mail::run(args, profile.as_deref()).await,
         Commands::Agent => {
             let content = agent::skill_content(agent::KAGI_SKILL).ok_or_else(|| {
                 KagiError::Config("embedded kagi skill is unavailable".to_string())
@@ -737,6 +765,7 @@ async fn run() -> Result<(), KagiError> {
             print_json(&response)
         }
         Commands::Fastgpt(args) => {
+            args.validate().map_err(KagiError::Config)?;
             let request = FastGptRequest {
                 query: args.query,
                 cache: args.cache,
@@ -3032,24 +3061,60 @@ async fn run_summarize_filter(
         ));
     }
 
-    let mut results = Vec::new();
+    let mut failure_count = 0usize;
     if args.subscriber {
         let token = resolve_session_token(profile)?;
         for item in lines {
             let request = summarize_item_request_subscriber(&item, &args);
-            let response = execute_subscriber_summarize(&request, &token).await?;
-            results.push(serde_json::json!({ "input": item, "response": response }));
+            match execute_subscriber_summarize(&request, &token).await {
+                Ok(response) => print_summarize_filter_item(&item, true, response)?,
+                Err(error) => {
+                    failure_count += 1;
+                    print_summarize_filter_item(&item, false, error_envelope(&error))?;
+                }
+            }
         }
     } else {
         let token = resolve_api_token(profile)?;
         for item in lines {
             let request = summarize_item_request_public(&item, &args);
-            let response = execute_summarize(&request, &token).await?;
-            results.push(serde_json::json!({ "input": item, "response": response }));
+            match execute_summarize(&request, &token).await {
+                Ok(response) => print_summarize_filter_item(&item, true, response)?,
+                Err(error) => {
+                    failure_count += 1;
+                    print_summarize_filter_item(&item, false, error_envelope(&error))?;
+                }
+            }
         }
     }
 
-    print_json(&serde_json::json!({ "results": results }))
+    if failure_count > 0 {
+        return Err(KagiError::Batch(format!(
+            "summarize --filter completed with {failure_count} failed item(s)"
+        )));
+    }
+
+    Ok(())
+}
+
+fn print_summarize_filter_item(
+    item: &str,
+    ok: bool,
+    payload: impl serde::Serialize,
+) -> Result<(), KagiError> {
+    if ok {
+        print_compact_json(&serde_json::json!({
+            "input": item,
+            "ok": true,
+            "response": payload,
+        }))
+    } else {
+        print_compact_json(&serde_json::json!({
+            "input": item,
+            "ok": false,
+            "error": payload,
+        }))
+    }
 }
 
 fn summarize_item_request_subscriber(
@@ -3187,21 +3252,20 @@ fn run_site_pref(command: SitePrefSubcommand) -> Result<(), KagiError> {
     match command {
         SitePrefSubcommand::List => print_json(&local::load_site_preferences()?),
         SitePrefSubcommand::Set(args) => {
-            let mut preferences = local::load_site_preferences()?;
             let domain = local::normalize_domain(&args.domain)?;
-            preferences
-                .domains
-                .insert(domain.clone(), site_pref_mode(args.mode));
-            local::save_site_preferences(&preferences)?;
-            print_json(
-                &serde_json::json!({ "domain": domain, "mode": site_pref_mode(args.mode).as_str() }),
-            )
+            let mode = site_pref_mode(args.mode);
+            local::update_site_preferences(|preferences| {
+                preferences.domains.insert(domain.clone(), mode);
+                Ok::<(), KagiError>(())
+            })?;
+            print_json(&serde_json::json!({ "domain": domain, "mode": mode.as_str() }))
         }
         SitePrefSubcommand::Remove(args) => {
-            let mut preferences = local::load_site_preferences()?;
             let domain = local::normalize_domain(&args.domain)?;
-            preferences.domains.remove(&domain);
-            local::save_site_preferences(&preferences)?;
+            local::update_site_preferences(|preferences| {
+                preferences.domains.remove(&domain);
+                Ok::<(), KagiError>(())
+            })?;
             print_json(&serde_json::json!({ "domain": domain, "removed": true }))
         }
     }
@@ -3278,9 +3342,53 @@ async fn run_assistant_repl(args: AssistantReplArgs, token: &str) -> Result<(), 
 struct McpServerConfig {
     default_output: Option<OutputFormat>,
     enable_mutating_tools: bool,
+    tool_definitions: Vec<Value>,
+}
+
+const MCP_PROTOCOL_VERSION: &str = "2026-07-28";
+const MCP_PROTOCOL_VERSION_META_KEY: &str = "io.modelcontextprotocol/protocolVersion";
+const MCP_CLIENT_INFO_META_KEY: &str = "io.modelcontextprotocol/clientInfo";
+const MCP_CLIENT_CAPABILITIES_META_KEY: &str = "io.modelcontextprotocol/clientCapabilities";
+const MCP_CACHE_TTL_MS: u64 = 3_600_000;
+
+/// Stable MCP protocol versions accepted by the `initialize` handshake, newest
+/// first.
+const MCP_STABLE_PROTOCOL_VERSIONS: [&str; 5] = [
+    "2025-11-25",
+    "2025-06-18",
+    "2025-03-26",
+    "2024-11-05",
+    "2024-10-07",
+];
+const MCP_STABLE_LATEST_VERSION: &str = "2025-11-25";
+
+#[derive(Debug)]
+struct McpProtocolError {
+    code: i64,
+    message: String,
+    data: Option<Value>,
+}
+
+impl McpProtocolError {
+    fn invalid_params(message: impl Into<String>) -> Self {
+        Self {
+            code: -32602,
+            message: message.into(),
+            data: None,
+        }
+    }
 }
 
 impl McpServerConfig {
+    fn new(default_output: Option<OutputFormat>, enable_mutating_tools: bool) -> Self {
+        let tool_definitions = build_mcp_tool_definitions(enable_mutating_tools);
+        Self {
+            default_output,
+            enable_mutating_tools,
+            tool_definitions,
+        }
+    }
+
     fn default_output_or(&self, fallback: OutputFormat) -> OutputFormat {
         self.default_output.clone().unwrap_or(fallback)
     }
@@ -3288,10 +3396,7 @@ impl McpServerConfig {
 
 async fn run_mcp(args: McpArgs, profile: Option<&str>) -> Result<(), KagiError> {
     let _json_lines = args.json_lines;
-    let config = McpServerConfig {
-        default_output: args.default_output,
-        enable_mutating_tools: args.enable_mutating_tools,
-    };
+    let config = McpServerConfig::new(args.default_output, args.enable_mutating_tools);
     let stdin = io::stdin();
     for line in stdin.lock().lines() {
         let line =
@@ -3311,41 +3416,60 @@ async fn run_mcp(args: McpArgs, profile: Option<&str>) -> Result<(), KagiError> 
         let Some(id) = request.get("id").cloned() else {
             continue;
         };
-        let method = request.get("method").and_then(Value::as_str).unwrap_or("");
-        let response = match method {
-            "initialize" => serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "result": {
-                    "protocolVersion": "2024-11-05",
-                    "serverInfo": {"name": "kagi-cli", "version": env!("CARGO_PKG_VERSION")},
-                    "capabilities": {"tools": {}}
-                }
-            }),
-            "tools/list" => serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "result": {
-                    "tools": mcp_tool_definitions(&config)
-                }
-            }),
-            "tools/call" => match run_mcp_tool_call(&request, profile, &config).await {
-                Ok(result) => serde_json::json!({
+
+        let Some(method) = request.get("method").and_then(Value::as_str) else {
+            let response = json_rpc_error(id, -32600, "Invalid Request: method is required".into());
+            println!("{}", serde_json::to_string(&response)?);
+            continue;
+        };
+
+        // The server auto-negotiates per request: draft `2026-07-28` requests carry
+        // the draft protocol version in `params._meta`, while stable-spec requests
+        // (including `initialize`) do not. The stable spec also permits `_meta`
+        // (e.g. `progressToken`), so discriminate on the namespaced draft key.
+        let speaks_draft = request_speaks_draft(&request);
+        let draft_validation = if speaks_draft {
+            validate_mcp_request(&request)
+        } else {
+            Ok(())
+        };
+
+        let response = match draft_validation {
+            Ok(()) => match method {
+                "initialize" => serde_json::json!({
                     "jsonrpc": "2.0",
                     "id": id,
-                    "result": result,
+                    "result": mcp_stable_initialize_result(&request),
                 }),
-                Err(error) => serde_json::json!({
+                "ping" => serde_json::json!({
                     "jsonrpc": "2.0",
                     "id": id,
-                    "error": {"code": -32000, "message": error.to_string()},
+                    "result": {},
                 }),
+                "server/discover" if speaks_draft => serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": mcp_discover_result(),
+                }),
+                "tools/list" if speaks_draft => match mcp_tools_list_result(&request, &config) {
+                    Ok(result) => serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": result,
+                    }),
+                    Err(error) => {
+                        json_rpc_error_with_data(id, error.code, error.message, error.data)
+                    }
+                },
+                "tools/list" => serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": mcp_stable_tools_list_result(&config),
+                }),
+                "tools/call" => mcp_tools_call_response(id, &request, profile, &config).await,
+                _ => json_rpc_error(id, -32601, format!("Method not found: {method}")),
             },
-            _ => serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "error": {"code": -32601, "message": format!("Method not found: {method}")},
-            }),
+            Err(error) => json_rpc_error_with_data(id, error.code, error.message, error.data),
         };
         println!("{}", serde_json::to_string(&response)?);
     }
@@ -3353,14 +3477,305 @@ async fn run_mcp(args: McpArgs, profile: Option<&str>) -> Result<(), KagiError> 
 }
 
 fn json_rpc_error(id: Value, code: i64, message: String) -> Value {
+    json_rpc_error_with_data(id, code, message, None)
+}
+
+fn json_rpc_error_with_data(id: Value, code: i64, message: String, data: Option<Value>) -> Value {
+    let mut error = serde_json::json!({
+        "code": code,
+        "message": message,
+    });
+    if let Some(data) = data {
+        error["data"] = data;
+    }
+
     serde_json::json!({
         "jsonrpc": "2.0",
         "id": id,
-        "error": {"code": code, "message": message},
+        "error": error,
     })
 }
 
-fn mcp_tool_definitions(config: &McpServerConfig) -> Value {
+async fn mcp_tools_call_response(
+    id: Value,
+    request: &Value,
+    profile: Option<&str>,
+    config: &McpServerConfig,
+) -> Value {
+    match validate_mcp_tool_call(request, config) {
+        Ok(()) => match run_mcp_tool_call(request, profile, config).await {
+            Ok(result) => serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": result,
+            }),
+            Err(error) => serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": mcp_tool_result(error.to_string(), true, false),
+            }),
+        },
+        Err(error) => json_rpc_error_with_data(id, error.code, error.message, error.data),
+    }
+}
+
+fn mcp_stable_initialize_result(request: &Value) -> Value {
+    let requested_version = request
+        .get("params")
+        .and_then(|params| params.get("protocolVersion"))
+        .and_then(Value::as_str);
+    let negotiated_version = requested_version
+        .filter(|version| MCP_STABLE_PROTOCOL_VERSIONS.contains(version))
+        .unwrap_or(MCP_STABLE_LATEST_VERSION);
+    serde_json::json!({
+        "protocolVersion": negotiated_version,
+        "serverInfo": {
+            "name": "kagi-cli",
+            "version": env!("CARGO_PKG_VERSION")
+        },
+        "capabilities": {
+            "tools": {}
+        }
+    })
+}
+
+fn mcp_stable_tools_list_result(config: &McpServerConfig) -> Value {
+    serde_json::json!({
+        "tools": config.tool_definitions.clone()
+    })
+}
+
+fn request_speaks_draft(request: &Value) -> bool {
+    request
+        .get("params")
+        .and_then(|params| params.get("_meta"))
+        .and_then(|meta| meta.get(MCP_PROTOCOL_VERSION_META_KEY))
+        .is_some()
+}
+
+fn validate_mcp_request(request: &Value) -> Result<(), McpProtocolError> {
+    if request.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+        return Err(McpProtocolError {
+            code: -32600,
+            message: "Invalid Request: jsonrpc must be \"2.0\"".to_string(),
+            data: None,
+        });
+    }
+
+    let params = request
+        .get("params")
+        .and_then(Value::as_object)
+        .ok_or_else(|| McpProtocolError::invalid_params("MCP request params must be an object"))?;
+    let meta = params
+        .get("_meta")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            McpProtocolError::invalid_params(
+                "MCP request params._meta must include protocolVersion and clientCapabilities",
+            )
+        })?;
+    let requested_version = meta
+        .get(MCP_PROTOCOL_VERSION_META_KEY)
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            McpProtocolError::invalid_params(format!(
+                "MCP request params._meta.{MCP_PROTOCOL_VERSION_META_KEY} is required"
+            ))
+        })?;
+    if requested_version != MCP_PROTOCOL_VERSION {
+        return Err(McpProtocolError {
+            code: -32022,
+            message: "Unsupported protocol version".to_string(),
+            data: Some(serde_json::json!({
+                "supported": [MCP_PROTOCOL_VERSION],
+                "requested": requested_version,
+            })),
+        });
+    }
+
+    if !meta
+        .get(MCP_CLIENT_CAPABILITIES_META_KEY)
+        .is_some_and(Value::is_object)
+    {
+        return Err(McpProtocolError::invalid_params(format!(
+            "MCP request params._meta.{MCP_CLIENT_CAPABILITIES_META_KEY} is required and must be an object"
+        )));
+    }
+
+    if let Some(client_info) = meta.get(MCP_CLIENT_INFO_META_KEY) {
+        let valid_client_info = client_info.as_object().is_some_and(|client_info| {
+            client_info.get("name").and_then(Value::as_str).is_some()
+                && client_info.get("version").and_then(Value::as_str).is_some()
+        });
+        if !valid_client_info {
+            return Err(McpProtocolError::invalid_params(format!(
+                "MCP request params._meta.{MCP_CLIENT_INFO_META_KEY} must include name and version"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn mcp_discover_result() -> Value {
+    serde_json::json!({
+        "resultType": "complete",
+        "supportedVersions": [MCP_PROTOCOL_VERSION],
+        "capabilities": {
+            "tools": {}
+        },
+        "_meta": {
+            "io.modelcontextprotocol/serverInfo": {
+                "name": "kagi-cli",
+                "version": env!("CARGO_PKG_VERSION")
+            }
+        },
+        "instructions": "Search Kagi web and news, extract and summarize pages, inspect Assistant threads, and inspect Kagi account or local CLI state. Prompting Assistant or changing account and local state requires --enable-mutating-tools.",
+        "ttlMs": MCP_CACHE_TTL_MS,
+        "cacheScope": "public"
+    })
+}
+
+fn mcp_tools_list_result(
+    request: &Value,
+    config: &McpServerConfig,
+) -> Result<Value, McpProtocolError> {
+    let params = request
+        .get("params")
+        .and_then(Value::as_object)
+        .ok_or_else(|| McpProtocolError::invalid_params("MCP request params must be an object"))?;
+    if params.get("cursor").is_some_and(|cursor| !cursor.is_null()) {
+        return Err(McpProtocolError::invalid_params(
+            "MCP tools/list does not issue pagination cursors because the complete tool catalog fits in one response",
+        ));
+    }
+
+    Ok(serde_json::json!({
+        "resultType": "complete",
+        "tools": config.tool_definitions.clone(),
+        "ttlMs": MCP_CACHE_TTL_MS,
+        "cacheScope": "public"
+    }))
+}
+
+fn validate_mcp_tool_call(
+    request: &Value,
+    config: &McpServerConfig,
+) -> Result<(), McpProtocolError> {
+    let params = request
+        .get("params")
+        .and_then(Value::as_object)
+        .ok_or_else(|| McpProtocolError::invalid_params("MCP request params must be an object"))?;
+    let name = params
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.trim().is_empty())
+        .ok_or_else(|| {
+            McpProtocolError::invalid_params("MCP tools/call requires a non-empty name")
+        })?;
+    if !config
+        .tool_definitions
+        .iter()
+        .any(|tool| tool["name"].as_str() == Some(name))
+    {
+        return Err(McpProtocolError {
+            code: -32602,
+            message: format!("Unknown tool: {name}"),
+            data: None,
+        });
+    }
+
+    if let Some(arguments) = params.get("arguments")
+        && !arguments.is_object()
+    {
+        return Err(McpProtocolError::invalid_params(
+            "MCP tools/call arguments must be an object",
+        ));
+    }
+
+    Ok(())
+}
+
+fn mcp_tool_result(text: String, is_error: bool, include_structured_content: bool) -> Value {
+    let mut result = serde_json::json!({
+        "resultType": "complete",
+        "content": [{ "type": "text", "text": text }],
+        "isError": is_error,
+    });
+    if include_structured_content && !is_error {
+        let text = result["content"][0]["text"]
+            .as_str()
+            .expect("MCP text content should be a string");
+        if let Ok(structured_content) = serde_json::from_str::<Value>(text) {
+            result["structuredContent"] = structured_content;
+        }
+    }
+    result
+}
+
+fn mcp_tool_has_structured_content(
+    name: &str,
+    arguments: &Value,
+    config: &McpServerConfig,
+) -> Result<bool, KagiError> {
+    let default = config.default_output_or(OutputFormat::Json);
+    // Only these tools honor a per-call `format` field. The remaining tools
+    // either use the server default, always return text, or have a format
+    // mapping handled explicitly below.
+    match name {
+        "kagi_auth_status" | "kagi_auth_check" => Ok(false),
+        "kagi_extract" => Ok(matches!(
+            mcp_extract_output_format(arguments, config)?,
+            OutputFormat::Json | OutputFormat::Compact
+        )),
+        "kagi_quick" => Ok(matches!(
+            mcp_quick_format(arguments, &default)?,
+            QuickOutputFormat::Json | QuickOutputFormat::Compact
+        )),
+        "kagi_assistant" => Ok(matches!(
+            mcp_assistant_format(arguments, &default)?,
+            AssistantOutputFormat::Json | AssistantOutputFormat::Compact
+        )),
+        "kagi_assistant_thread_export" => {
+            match mcp_string_or(arguments, "format", "markdown").as_str() {
+                "json" => Ok(true),
+                "markdown" => Ok(false),
+                other => Err(KagiError::Config(format!(
+                    "unsupported thread export format `{other}`. Use markdown or json"
+                ))),
+            }
+        }
+        "kagi_search" => {
+            let is_json = is_structured_output_format(&mcp_output_format(arguments, &default)?);
+            let uses_template = arguments.get("template").and_then(Value::as_str).is_some()
+                && arguments.get("news").and_then(Value::as_bool) != Some(true);
+            Ok(is_json && !uses_template)
+        }
+        "kagi_batch_search"
+        | "kagi_summarize"
+        | "kagi_news"
+        | "kagi_news_categories"
+        | "kagi_news_chaos"
+        | "kagi_news_filter_presets"
+        | "kagi_news_search"
+        | "kagi_ask_page"
+        | "kagi_translate"
+        | "kagi_fastgpt"
+        | "kagi_enrich_web"
+        | "kagi_enrich_news"
+        | "kagi_smallweb"
+        | "kagi_cli" => Ok(is_structured_output_format(&mcp_output_format(
+            arguments, &default,
+        )?)),
+        _ => Ok(is_structured_output_format(&default)),
+    }
+}
+
+fn is_structured_output_format(format: &OutputFormat) -> bool {
+    matches!(format, OutputFormat::Json | OutputFormat::Compact)
+}
+
+fn build_mcp_tool_definitions(enable_mutating_tools: bool) -> Vec<Value> {
     let mut tools = vec![
         tool_schema(
             "kagi_search",
@@ -3409,11 +3824,6 @@ fn mcp_tool_definitions(config: &McpServerConfig) -> Value {
             news_search_schema(),
         ),
         tool_schema(
-            "kagi_assistant",
-            "Prompt Kagi Assistant",
-            assistant_schema(),
-        ),
-        tool_schema(
             "kagi_assistant_models",
             "List Assistant base-model slugs",
             empty_schema(),
@@ -3442,11 +3852,6 @@ fn mcp_tool_definitions(config: &McpServerConfig) -> Value {
             "kagi_assistant_custom_get",
             "Fetch a custom assistant by id or name",
             target_schema("target", "Custom assistant id or exact name"),
-        ),
-        tool_schema(
-            "kagi_ask_page",
-            "Ask Assistant about a page",
-            ask_page_schema(),
         ),
         tool_schema(
             "kagi_translate",
@@ -3518,8 +3923,18 @@ fn mcp_tool_definitions(config: &McpServerConfig) -> Value {
         ),
     ];
 
-    if config.enable_mutating_tools {
+    if enable_mutating_tools {
         tools.extend([
+            tool_schema(
+                "kagi_assistant",
+                "Prompt Kagi Assistant",
+                assistant_schema(),
+            ),
+            tool_schema(
+                "kagi_ask_page",
+                "Ask Assistant about a page",
+                ask_page_schema(),
+            ),
             tool_schema(
                 "kagi_assistant_thread_delete",
                 "Delete an Assistant thread",
@@ -3623,7 +4038,13 @@ fn mcp_tool_definitions(config: &McpServerConfig) -> Value {
         ]);
     }
 
-    Value::Array(tools)
+    tools.sort_by(|left, right| {
+        left["name"]
+            .as_str()
+            .unwrap_or_default()
+            .cmp(right["name"].as_str().unwrap_or_default())
+    });
+    tools
 }
 
 fn tool_schema(name: &str, description: &str, input_schema: Value) -> Value {
@@ -3631,11 +4052,114 @@ fn tool_schema(name: &str, description: &str, input_schema: Value) -> Value {
         "name": name,
         "description": description,
         "inputSchema": input_schema,
+        "annotations": mcp_tool_annotations(name),
     })
+}
+
+fn mcp_tool_annotations(name: &str) -> Value {
+    let read_only = !mcp_mutating_tool_name(name);
+    let mut annotations = serde_json::json!({
+        "readOnlyHint": read_only,
+        "openWorldHint": mcp_open_world_tool_name(name),
+    });
+    if !read_only {
+        if mcp_destructive_tool_name(name) {
+            annotations["destructiveHint"] = serde_json::json!(true);
+        }
+        annotations["idempotentHint"] = serde_json::json!(mcp_idempotent_tool_name(name));
+    }
+    annotations
+}
+
+fn mcp_mutating_tool_name(name: &str) -> bool {
+    matches!(
+        name,
+        "kagi_assistant"
+            | "kagi_ask_page"
+            | "kagi_assistant_thread_delete"
+            | "kagi_assistant_custom_create"
+            | "kagi_assistant_custom_update"
+            | "kagi_assistant_custom_delete"
+            | "kagi_lens_create"
+            | "kagi_lens_update"
+            | "kagi_lens_delete"
+            | "kagi_lens_enable"
+            | "kagi_lens_disable"
+            | "kagi_custom_bang_create"
+            | "kagi_custom_bang_update"
+            | "kagi_custom_bang_delete"
+            | "kagi_redirect_create"
+            | "kagi_redirect_update"
+            | "kagi_redirect_delete"
+            | "kagi_redirect_enable"
+            | "kagi_redirect_disable"
+            | "kagi_site_pref_set"
+            | "kagi_site_pref_remove"
+            | "kagi_cli"
+    )
+}
+
+fn mcp_destructive_tool_name(name: &str) -> bool {
+    matches!(
+        name,
+        "kagi_assistant_thread_delete"
+            | "kagi_assistant_custom_delete"
+            | "kagi_lens_delete"
+            | "kagi_custom_bang_delete"
+            | "kagi_redirect_delete"
+            | "kagi_site_pref_remove"
+            | "kagi_cli"
+    )
+}
+
+fn mcp_idempotent_tool_name(name: &str) -> bool {
+    matches!(
+        name,
+        "kagi_assistant_thread_delete"
+            | "kagi_assistant_custom_update"
+            | "kagi_assistant_custom_delete"
+            | "kagi_lens_update"
+            | "kagi_lens_delete"
+            | "kagi_lens_enable"
+            | "kagi_lens_disable"
+            | "kagi_custom_bang_update"
+            | "kagi_custom_bang_delete"
+            | "kagi_redirect_update"
+            | "kagi_redirect_delete"
+            | "kagi_redirect_enable"
+            | "kagi_redirect_disable"
+            | "kagi_site_pref_set"
+            | "kagi_site_pref_remove"
+    )
+}
+
+fn mcp_open_world_tool_name(name: &str) -> bool {
+    matches!(
+        name,
+        "kagi_search"
+            | "kagi_batch_search"
+            | "kagi_summarize"
+            | "kagi_extract"
+            | "kagi_quick"
+            | "kagi_news"
+            | "kagi_news_categories"
+            | "kagi_news_chaos"
+            | "kagi_news_filter_presets"
+            | "kagi_news_search"
+            | "kagi_assistant"
+            | "kagi_ask_page"
+            | "kagi_translate"
+            | "kagi_fastgpt"
+            | "kagi_enrich_web"
+            | "kagi_enrich_news"
+            | "kagi_smallweb"
+            | "kagi_cli"
+    )
 }
 
 fn object_schema(properties: Value, required: &[&str]) -> Value {
     serde_json::json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
         "type": "object",
         "properties": properties,
         "required": required,
@@ -4057,6 +4581,7 @@ async fn run_mcp_tool_call(
         .get("arguments")
         .cloned()
         .unwrap_or_else(|| serde_json::json!({}));
+    let include_structured_content = mcp_tool_has_structured_content(name, &arguments, config)?;
     let text = match name {
         "kagi_search" => mcp_search(&arguments, profile, config).await?,
         "kagi_batch_search" => mcp_batch_search(&arguments, profile, config).await?,
@@ -4077,7 +4602,6 @@ async fn run_mcp_tool_call(
             mcp_output_format(&arguments, &config.default_output_or(OutputFormat::Json))?,
         )?,
         "kagi_news_search" => mcp_news_search(&arguments, profile, config).await?,
-        "kagi_assistant" => mcp_assistant(&arguments, profile, config).await?,
         "kagi_assistant_models" => {
             let token = resolve_session_token(profile)?;
             mcp_output(
@@ -4119,21 +4643,6 @@ async fn run_mcp_tool_call(
                 &execute_custom_assistant_get(&mcp_required_string(&arguments, "target")?, &token)
                     .await?,
                 config.default_output_or(OutputFormat::Json),
-            )?
-        }
-        "kagi_ask_page" => {
-            let token = resolve_session_token(profile)?;
-            let response = execute_ask_page(
-                &AskPageRequest {
-                    url: mcp_required_string(&arguments, "url")?,
-                    question: mcp_required_string(&arguments, "question")?,
-                },
-                &token,
-            )
-            .await?;
-            mcp_output(
-                &response,
-                mcp_output_format(&arguments, &config.default_output_or(OutputFormat::Json))?,
             )?
         }
         "kagi_translate" => mcp_translate(&arguments, profile, config).await?,
@@ -4213,7 +4722,9 @@ async fn run_mcp_tool_call(
             &local::load_site_preferences()?,
             config.default_output_or(OutputFormat::Json),
         )?,
-        "kagi_assistant_thread_delete"
+        "kagi_assistant"
+        | "kagi_ask_page"
+        | "kagi_assistant_thread_delete"
         | "kagi_assistant_custom_create"
         | "kagi_assistant_custom_update"
         | "kagi_assistant_custom_delete"
@@ -4239,7 +4750,7 @@ async fn run_mcp_tool_call(
             )));
         }
     };
-    Ok(serde_json::json!({ "content": [{ "type": "text", "text": text }] }))
+    Ok(mcp_tool_result(text, false, include_structured_content))
 }
 
 async fn mcp_mutating_tool_call(
@@ -4254,12 +4765,30 @@ async fn mcp_mutating_tool_call(
         )));
     }
 
+    if name == "kagi_assistant" {
+        return mcp_assistant(arguments, profile, config).await;
+    }
+
     if name == "kagi_cli" {
         return mcp_cli_passthrough(arguments, config);
     }
 
     let token = resolve_session_token(profile)?;
     match name {
+        "kagi_ask_page" => {
+            let response = execute_ask_page(
+                &AskPageRequest {
+                    url: mcp_required_string(arguments, "url")?,
+                    question: mcp_required_string(arguments, "question")?,
+                },
+                &token,
+            )
+            .await?;
+            mcp_output(
+                &response,
+                mcp_output_format(arguments, &config.default_output_or(OutputFormat::Json))?,
+            )
+        }
         "kagi_assistant_thread_delete" => mcp_output(
             &execute_assistant_thread_delete(&mcp_required_string(arguments, "thread_id")?, &token)
                 .await?,
@@ -4362,21 +4891,23 @@ async fn mcp_mutating_tool_call(
             config.default_output_or(OutputFormat::Json),
         ),
         "kagi_site_pref_set" => {
-            let mut preferences = local::load_site_preferences()?;
             let domain = local::normalize_domain(&mcp_required_string(arguments, "domain")?)?;
             let mode = mcp_site_pref_mode(arguments)?;
-            preferences.domains.insert(domain.clone(), mode);
-            local::save_site_preferences(&preferences)?;
+            local::update_site_preferences(|preferences| {
+                preferences.domains.insert(domain.clone(), mode);
+                Ok::<(), KagiError>(())
+            })?;
             mcp_output(
                 &serde_json::json!({"domain": domain, "mode": mode.as_str()}),
                 config.default_output_or(OutputFormat::Json),
             )
         }
         "kagi_site_pref_remove" => {
-            let mut preferences = local::load_site_preferences()?;
             let domain = local::normalize_domain(&mcp_required_string(arguments, "domain")?)?;
-            preferences.domains.remove(&domain);
-            local::save_site_preferences(&preferences)?;
+            local::update_site_preferences(|preferences| {
+                preferences.domains.remove(&domain);
+                Ok::<(), KagiError>(())
+            })?;
             mcp_output(
                 &serde_json::json!({"domain": domain, "removed": true}),
                 config.default_output_or(OutputFormat::Json),
@@ -4686,42 +5217,48 @@ async fn mcp_extract(
     config: &McpServerConfig,
 ) -> Result<String, KagiError> {
     let url = mcp_required_string(arguments, "url")?;
-    let format = arguments
+    match mcp_extract_output_format(arguments, config)? {
+        OutputFormat::Markdown => execute_extract_with_available_auth(&url, profile).await,
+        OutputFormat::Compact => {
+            let response = execute_extract_response_with_available_auth(&url, profile).await?;
+            serde_json::to_string(&response).map_err(KagiError::from)
+        }
+        OutputFormat::Toon => {
+            let response = execute_extract_response_with_available_auth(&url, profile).await?;
+            mcp_output(&response, OutputFormat::Toon)
+        }
+        OutputFormat::Json => {
+            let response = execute_extract_response_with_available_auth(&url, profile).await?;
+            mcp_output(&response, OutputFormat::Json)
+        }
+        OutputFormat::Pretty | OutputFormat::Csv => {
+            unreachable!("MCP extract format normalization should not return pretty or csv")
+        }
+    }
+}
+
+fn mcp_extract_output_format(
+    arguments: &Value,
+    config: &McpServerConfig,
+) -> Result<OutputFormat, KagiError> {
+    let requested = arguments
         .get("format")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_ascii_lowercase);
-    match format.as_deref() {
-        Some("markdown") => execute_extract_with_available_auth(&url, profile).await,
-        Some("compact") => {
-            let response = execute_extract_response_with_available_auth(&url, profile).await?;
-            serde_json::to_string(&response).map_err(KagiError::from)
-        }
-        Some("toon") => {
-            let response = execute_extract_response_with_available_auth(&url, profile).await?;
-            mcp_output(&response, OutputFormat::Toon)
-        }
-        Some("json") => {
-            let response = execute_extract_response_with_available_auth(&url, profile).await?;
-            mcp_output(&response, OutputFormat::Json)
-        }
+    match requested.as_deref() {
+        Some("markdown") => Ok(OutputFormat::Markdown),
+        Some("compact") => Ok(OutputFormat::Compact),
+        Some("toon") => Ok(OutputFormat::Toon),
+        Some("json") => Ok(OutputFormat::Json),
         None => match config.default_output.clone() {
             None | Some(OutputFormat::Markdown | OutputFormat::Pretty) => {
-                execute_extract_with_available_auth(&url, profile).await
+                Ok(OutputFormat::Markdown)
             }
-            Some(OutputFormat::Compact) => {
-                let response = execute_extract_response_with_available_auth(&url, profile).await?;
-                serde_json::to_string(&response).map_err(KagiError::from)
-            }
-            Some(OutputFormat::Toon) => {
-                let response = execute_extract_response_with_available_auth(&url, profile).await?;
-                mcp_output(&response, OutputFormat::Toon)
-            }
-            Some(OutputFormat::Json | OutputFormat::Csv) => {
-                let response = execute_extract_response_with_available_auth(&url, profile).await?;
-                mcp_output(&response, OutputFormat::Json)
-            }
+            Some(OutputFormat::Compact) => Ok(OutputFormat::Compact),
+            Some(OutputFormat::Toon) => Ok(OutputFormat::Toon),
+            Some(OutputFormat::Json | OutputFormat::Csv) => Ok(OutputFormat::Json),
         },
         Some(other) => Err(KagiError::Config(format!(
             "unsupported extract format `{other}`. Use markdown, json, compact, or toon"
@@ -5779,6 +6316,7 @@ mod tests {
                 documents: vec![],
                 profile: None,
                 trace_id: None,
+                usage: None,
             },
         }
     }

@@ -1,11 +1,11 @@
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
 
-use httpmock::Method::{GET, POST};
+use httpmock::Method::{DELETE, GET, PATCH, POST};
 use httpmock::MockServer;
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -23,6 +23,7 @@ fn run_kagi(args: &[&str], envs: &[(&str, &str)], cwd: &Path) -> Output {
         "KAGI_SESSION_TOKEN",
         "KAGI_BASE_URL",
         "KAGI_ASSISTANT_BASE_URL",
+        "KAGI_ASSISTANT_API_BASE_URL",
         "KAGI_NEWS_BASE_URL",
         "KAGI_TRANSLATE_BASE_URL",
         "KAGI_ERROR_FORMAT",
@@ -58,6 +59,7 @@ fn run_kagi_with_stdin(args: &[&str], stdin: &str, envs: &[(&str, &str)], cwd: &
         "KAGI_SESSION_TOKEN",
         "KAGI_BASE_URL",
         "KAGI_ASSISTANT_BASE_URL",
+        "KAGI_ASSISTANT_API_BASE_URL",
         "KAGI_NEWS_BASE_URL",
         "KAGI_TRANSLATE_BASE_URL",
         "KAGI_ERROR_FORMAT",
@@ -106,6 +108,21 @@ fn write_config(cwd: &Path, contents: &str) {
     fs::write(path, contents).expect("config should write");
 }
 
+fn vscode_user_dir(cwd: &Path) -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        cwd.join("Library")
+            .join("Application Support")
+            .join("Code")
+            .join("User")
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        cwd.join(".config").join("Code").join("User")
+    }
+}
+
 fn assert_success(output: &Output) {
     assert!(
         output.status.success(),
@@ -128,8 +145,8 @@ fn help_points_agents_to_agent_guide() {
         "expected agent help section, got:\n{stdout}"
     );
     assert!(
-        stdout.contains("kagi skills get kagi"),
-        "expected help to mention kagi skills get kagi, got:\n{stdout}"
+        stdout.contains("kagi skills get kagi-usage"),
+        "expected help to mention kagi skills get kagi-usage, got:\n{stdout}"
     );
     assert!(
         stdout.contains("skills [list]"),
@@ -241,7 +258,7 @@ fn agent_command_prints_embedded_skill_guide_without_auth() {
 #[test]
 fn skills_get_prints_core_guide_without_auth() {
     let tempdir = TempDir::new().expect("tempdir");
-    let output = run_kagi(&["skills", "get", "kagi"], &[], tempdir.path());
+    let output = run_kagi(&["skills", "get", "kagi-usage"], &[], tempdir.path());
 
     assert_success(&output);
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -250,7 +267,7 @@ fn skills_get_prints_core_guide_without_auth() {
         "expected markdown skill guide, got:\n{stdout}"
     );
     assert!(
-        stdout.contains("kagi skills get kagi"),
+        stdout.contains("kagi skills get <name>"),
         "expected skills command guidance, got:\n{stdout}"
     );
 }
@@ -261,11 +278,19 @@ fn skills_list_and_path_are_auth_free() {
 
     let list = run_kagi(&["skills"], &[], tempdir.path());
     assert_success(&list);
-    assert!(
-        String::from_utf8_lossy(&list.stdout).contains("kagi                 Core CLI usage guide"),
-        "expected core skill listing, got:\n{}",
-        String::from_utf8_lossy(&list.stdout)
-    );
+    let stdout = String::from_utf8_lossy(&list.stdout);
+    for skill in [
+        "kagi-usage",
+        "kagi-ai",
+        "kagi-assistant",
+        "kagi-monitoring",
+        "kagi-account-config",
+    ] {
+        assert!(
+            stdout.contains(skill),
+            "expected {skill} in skill listing, got:\n{stdout}"
+        );
+    }
 
     let path = run_kagi(&["skills", "path"], &[], tempdir.path());
     assert_success(&path);
@@ -274,18 +299,22 @@ fn skills_list_and_path_are_auth_free() {
         "embedded://skills"
     );
 
-    let skill_path = run_kagi(&["skills", "path", "kagi"], &[], tempdir.path());
+    let skill_path = run_kagi(&["skills", "path", "kagi-usage"], &[], tempdir.path());
     assert_success(&skill_path);
     assert_eq!(
         String::from_utf8_lossy(&skill_path.stdout).trim(),
-        "embedded://skills/kagi"
+        "embedded://skills/kagi-usage"
     );
 }
 
 #[test]
 fn skills_get_full_prints_body_without_frontmatter() {
     let tempdir = TempDir::new().expect("tempdir");
-    let output = run_kagi(&["skills", "get", "kagi", "--full"], &[], tempdir.path());
+    let output = run_kagi(
+        &["skills", "get", "kagi-usage", "--full"],
+        &[],
+        tempdir.path(),
+    );
 
     assert_success(&output);
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -315,41 +344,95 @@ fn env_refs(values: &[(impl AsRef<str>, impl AsRef<str>)]) -> Vec<(&str, &str)> 
         .collect()
 }
 
+fn mcp_request(id: Value, method: &str, params: Value) -> Value {
+    mcp_request_with_version(id, method, params, "2026-07-28")
+}
+
+fn mcp_request_with_version(id: Value, method: &str, params: Value, version: &str) -> Value {
+    let mut params = params
+        .as_object()
+        .expect("MCP test params should be an object")
+        .clone();
+    params.insert(
+        "_meta".to_string(),
+        json!({
+            "io.modelcontextprotocol/protocolVersion": version,
+            "io.modelcontextprotocol/clientInfo": {
+                "name": "kagi-cli-integration-tests",
+                "version": "1.0.0"
+            },
+            "io.modelcontextprotocol/clientCapabilities": {}
+        }),
+    );
+
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": method,
+        "params": Value::Object(params),
+    })
+}
+
 fn session_env(server: &MockServer) -> Vec<(&'static str, String)> {
     vec![
         ("KAGI_SESSION_TOKEN", "test-session".to_string()),
         ("KAGI_BASE_URL", server.base_url()),
         ("KAGI_ASSISTANT_BASE_URL", server.base_url()),
+        ("KAGI_ASSISTANT_API_BASE_URL", server.base_url()),
     ]
+}
+
+#[test]
+fn usage_command_returns_billing_report() {
+    let server = MockServer::start();
+    let billing = server.mock(|when, then| {
+        when.method(GET)
+            .path("/settings/billing")
+            .header("cookie", "kagi_session=test-session");
+        then.status(200).header("content-type", "text/html").body(
+            r#"
+                <html><body>
+                  <div>Ultimate $25 (+tax) per month</div>
+                  <div>Total AI cost this period (USD) $2,50 / $25,00</div>
+                  <div>Account balance $5.00</div>
+                  <p>Next renewal is 2026-01-28</p>
+                  <div>August 2026</div>
+                  <table>
+                    <tr><th>Date (UTC)</th><th>Searches</th><th>AI Cost (USD)</th></tr>
+                    <tr><td>2026-08-21</td><td>7</td><td>0.125</td></tr>
+                  </table>
+                </body></html>
+                "#,
+        );
+    });
+
+    let tempdir = TempDir::new().expect("tempdir");
+    let env = session_env(&server);
+    let output = run_kagi(
+        &["usage", "--format", "json"],
+        &env_refs(&env),
+        tempdir.path(),
+    );
+
+    assert_success(&output);
+    billing.assert_calls(1);
+    let body: Value = serde_json::from_slice(&output.stdout).expect("usage JSON should parse");
+    assert_eq!(body["plan"], "Ultimate");
+    assert_eq!(body["ai_cost"]["used_usd"], 2.5);
+    assert_eq!(body["ai_cost"]["limit_usd"], 25.0);
+    assert_eq!(body["daily_usage"][0]["searches"], 7);
 }
 
 #[test]
 fn assistant_prompt_stream_reads_query_from_stdin() {
     let server = MockServer::start();
-    let prompt = server.mock(|when, then| {
-        when.method(POST)
-            .path("/assistant/prompt")
-            .header("cookie", "kagi_session=test-session")
-            .header("accept", "application/vnd.kagi.stream")
-            .json_body(json!({
-                "focus": {
-                    "thread_id": null,
-                    "branch_id": "00000000-0000-4000-0000-000000000000",
-                    "prompt": "do a little dance",
-                    "message_id": null,
-                },
-                "profile": {},
-            }));
-        then.status(200)
-            .header("content-type", "application/vnd.kagi.stream")
-            .body(concat!(
-                "hi:{\"v\":\"test\",\"trace\":\"trace-stdin\"}\0\n",
-                "thread.json:{\"id\":\"thread-stdin\",\"title\":\"Stdin test\",\"ack\":\"2026-06-07T00:00:00Z\",\"created_at\":\"2026-06-07T00:00:00Z\",\"saved\":false,\"shared\":false,\"branch_id\":\"00000000-0000-4000-0000-000000000000\",\"folder_ids\":[]}\0\n",
-                "new_message.json:{\"id\":\"msg-stdin\",\"thread_id\":\"thread-stdin\",\"created_at\":\"2026-06-07T00:00:00Z\",\"state\":\"streaming\",\"prompt\":\"do a little dance\",\"md\":\"dance\",\"documents\":[]}\0\n",
-                "new_message.json:{\"id\":\"msg-stdin\",\"thread_id\":\"thread-stdin\",\"created_at\":\"2026-06-07T00:00:00Z\",\"state\":\"done\",\"prompt\":\"do a little dance\",\"md\":\"dance-ok\",\"documents\":[]}\0\n",
-            ));
-    });
-
+    let current_prompt = mock_current_assistant_prompt(
+        &server,
+        "do a little dance",
+        Some("dance"),
+        "dance-ok",
+        None,
+    );
     let tempdir = TempDir::new().expect("tempdir");
     let env = session_env(&server);
     let output = run_kagi_with_stdin(
@@ -360,7 +443,7 @@ fn assistant_prompt_stream_reads_query_from_stdin() {
     );
 
     assert_success(&output);
-    prompt.assert_calls(1);
+    current_prompt.assert_calls(1);
     assert_eq!(String::from_utf8_lossy(&output.stdout), "dance-ok\n");
 }
 
@@ -372,72 +455,162 @@ fn api_meta() -> Value {
     })
 }
 
-fn assistant_form_html(profile_id: &str, name: &str) -> String {
-    format!(
-        r#"
-        <form class="s-form" action="/settings/ast/profiles/update" method="POST">
-          <input type="hidden" name="profile_id" value="{profile_id}">
-          <input type="text" name="name" value="{name}">
-          <input type="text" name="bang_trigger" value="">
-          <input type="checkbox" name="internet_access" checked value="on">
-          <input type="hidden" name="internet_access" value="false">
-          <input type="radio" name="selected_lens" value="0" checked class="hidden">
-          <input type="checkbox" name="personalizations" checked value="on">
-          <input type="hidden" name="personalizations" value="false">
-          <input type="radio" name="base_model" value="gpt-5-mini" aria-label="GPT 5 Mini" checked class="hidden">
-          <input type="radio" name="base_model" value="claude-4-7-opus" aria-label="Claude Opus" class="hidden">
-          <textarea name="custom_instructions"></textarea>
-        </form>
-        <form action="/settings/ast/profiles/delete" method="POST"></form>
-        "#
-    )
+fn assistant_init_json(custom_assistants: Value) -> Value {
+    json!({
+        "models": {
+            "models": [{
+                "id": "gpt-5-mini",
+                "display_name": "GPT 5 Mini"
+            }],
+            "default": "gpt-5-mini",
+            "assistants": [{
+                "id": "assistant:code",
+                "name": "Code",
+                "underlying_model": "gpt-5-mini",
+                "internet_access": true
+            }]
+        },
+        "custom_assistants": custom_assistants
+    })
 }
 
-fn assistant_list_html() -> &'static str {
-    r#"
-    <div id="custom_mode_table">
-      <ul id="items_p">
-        <li class="item" id="profile-once">
-          <div class="item-name">
-            <a href="/assistant?profile=profile-once">Once</a>
-          </div>
-          <dl class="item-details">
-            <div><dt>Model:</dt><dd>GPT 5 Mini</dd></div>
-            <div></div>
-            <div><dt>Internet Access:</dt><dd>On</dd></div>
-          </dl>
-          <div class="edit">
-            <a href="/settings/custom_assistant?id=profile-once">Edit</a>
-          </div>
-        </li>
-      </ul>
-    </div>
-    "#
+fn custom_assistant_json(id: &str, name: &str, model: &str) -> Value {
+    json!({
+        "uuid": id,
+        "name": name,
+        "llm_id": model,
+        "instructions": "",
+        "internet_access": true,
+        "personalizations": false,
+        "lens_id": null,
+        "bang_trigger": null
+    })
 }
 
-fn assistant_prompt_stream_body(markdown: &str) -> String {
-    let hello = json!({ "v": "test", "trace": "trace-contract" });
-    let thread = json!({
-        "id": "thread-contract",
-        "title": "Contract",
-        "ack": "2026-06-07T00:00:00Z",
-        "created_at": "2026-06-07T00:00:00Z",
-        "saved": false,
-        "shared": false,
-        "branch_id": "00000000-0000-4000-0000-000000000000",
-        "folder_ids": []
+fn mock_current_assistant_prompt<'a>(
+    server: &'a MockServer,
+    expected_message: &str,
+    first_markdown: Option<&str>,
+    final_markdown: &str,
+    expected_profile_id: Option<&str>,
+) -> httpmock::Mock<'a> {
+    server.mock(|when, then| {
+        when.method(POST)
+            .path("/api/conversations")
+            .header("cookie", "kagi_session=test-session")
+            .header("accept", "application/json");
+        then.status(200).json_body(json!({
+            "conversation": {
+                "uuid": "thread-current",
+                "title": "New chat",
+                "created_at": "2026-07-25T00:00:00Z",
+                "updated_at": "2026-07-25T00:00:00Z",
+                "is_saved": false,
+                "is_shared": false,
+                "folder_uuid": null
+            },
+            "default_branch": {
+                "uuid": "branch-current",
+                "is_default": true
+            }
+        }));
     });
-    let message = json!({
-        "id": "msg-contract",
-        "thread_id": "thread-contract",
-        "created_at": "2026-06-07T00:00:00Z",
-        "state": "done",
-        "prompt": "contract prompt",
-        "md": markdown,
-        "documents": []
+    server.mock(|when, then| {
+        when.method(GET)
+            .path("/api/conversations/thread-current/init")
+            .header("cookie", "kagi_session=test-session")
+            .header("accept", "application/json");
+        then.status(200).json_body(json!({
+            "conversation": {
+                "uuid": "thread-current",
+                "title": "Current Assistant",
+                "created_at": "2026-07-25T00:00:00Z",
+                "updated_at": "2026-07-25T00:00:00Z",
+                "is_saved": false,
+                "is_shared": false,
+                "folder_uuid": null
+            },
+            "active_branch": {
+                "uuid": "branch-current",
+                "is_default": true
+            },
+            "branches": [{
+                "uuid": "branch-current",
+                "is_default": true
+            }],
+            "messages": {
+                "items": [],
+                "has_more": false
+            }
+        }));
     });
-
-    format!("hi:{hello}\0\nthread.json:{thread}\0\nnew_message.json:{message}\0\n")
+    let expected_profile_fragment = expected_profile_id
+        .map(|profile_id| format!("\"profile_uuid\":\"{profile_id}\""))
+        .unwrap_or_default();
+    let message = server.mock(|when, then| {
+        when.method(POST)
+            .path("/api/branches/branch-current/messages")
+            .header("cookie", "kagi_session=test-session")
+            .header("content-type", "application/json")
+            .body_includes(expected_message)
+            .body_includes(&expected_profile_fragment);
+        then.status(200).json_body(json!({
+            "conversation": {
+                "uuid": "thread-current",
+                "title": "New chat",
+                "created_at": "2026-07-25T00:00:00Z",
+                "updated_at": "2026-07-25T00:00:00Z",
+                "is_saved": false,
+                "is_shared": false,
+                "folder_uuid": null
+            },
+            "branch": {
+                "uuid": "branch-current",
+                "is_default": true
+            },
+            "user_message": {
+                "uuid": "user-current",
+                "role": "user",
+                "content": expected_message,
+                "created_at": "2026-07-25T00:00:00Z",
+                "references": [],
+                "attachments": []
+            }
+        }));
+    });
+    let mut frames = String::new();
+    if let Some(first_markdown) = first_markdown {
+        frames.push_str(&format!(
+            "data: {}\n\n",
+            json!({"text": first_markdown, "is_final": false})
+        ));
+    }
+    frames.push_str(&format!(
+        "data: {}\n\ndata: [DONE]\n\n",
+        json!({
+            "text": final_markdown,
+            "html_content": format!("<p>{final_markdown}</p>"),
+            "conversation_title": "Current Assistant",
+            "assistant_message_uuid": "assistant-current",
+            "usage": {
+                "input_tokens": 4314,
+                "output_tokens": 2,
+                "total_tokens": 4316,
+                "cost_usd": 0.006192
+            },
+            "is_final": true
+        })
+    ));
+    server.mock(move |when, then| {
+        when.method(GET)
+            .path("/api/branches/branch-current/stream")
+            .header("cookie", "kagi_session=test-session")
+            .header("accept", "text/event-stream");
+        then.status(200)
+            .header("content-type", "text/event-stream")
+            .body(frames);
+    });
+    message
 }
 
 fn search_payload(title: &str, url: &str, snippet: &str) -> Value {
@@ -472,9 +645,7 @@ fn lens_settings_html_fixture() -> &'static str {
       <input type="hidden" name="lens_id" value="22524">
       <input type="hidden" name="active_index" value="2">
       <a class="lens_title" href="/settings/update_lens?id=22524"><div>Rust Docs</div></a>
-      <div class="lens_edit_lens">
-        <a aria-label="Edit lens" href="/settings/update_lens?id=22524">Edit</a>
-      </div>
+      <a aria-label="Rediger linse" href="/settings/update_lens?id=22524">Rediger</a>
     </form>
     "#
 }
@@ -1327,15 +1498,8 @@ fn mcp_install_writes_vs_code_user_config_without_client_cli() {
     );
 
     assert_success(&output);
-    let raw = fs::read_to_string(
-        tempdir
-            .path()
-            .join(".config")
-            .join("Code")
-            .join("User")
-            .join("mcp.json"),
-    )
-    .expect("VS Code MCP config should be written");
+    let raw = fs::read_to_string(vscode_user_dir(tempdir.path()).join("mcp.json"))
+        .expect("VS Code MCP config should be written");
     let config: Value = serde_json::from_str(&raw).expect("VS Code MCP config should parse");
     assert_eq!(
         config["servers"]["kagi-mcp"],
@@ -1363,11 +1527,7 @@ fn mcp_install_writes_roo_code_extension_config() {
     );
 
     assert_success(&output);
-    let path = tempdir
-        .path()
-        .join(".config")
-        .join("Code")
-        .join("User")
+    let path = vscode_user_dir(tempdir.path())
         .join("globalStorage")
         .join("rooveterinaryinc.roo-cline")
         .join("settings")
@@ -1515,6 +1675,86 @@ fn summarize_url_command_prints_structured_json() {
     assert_success(&output);
     let body: Value = serde_json::from_slice(&output.stdout).expect("json output should parse");
     assert_eq!(body["data"]["output"], "A concise summary.");
+}
+
+#[test]
+fn subscriber_summarize_posts_form_to_assistant_api() {
+    let server = MockServer::start();
+    let summarize = server.mock(|when, then| {
+        when.method(POST)
+            .path("/mother/summary_labs")
+            .header("cookie", "kagi_session=test-session")
+            .header("accept", "application/vnd.kagi.stream")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body_includes("url=https%3A%2F%2Fexample.com%2Farticle")
+            .body_includes("stream=1")
+            .body_includes("summary_type=keypoints")
+            .body_includes("summary_length=digest");
+        then.status(200)
+            .header("content-type", "application/vnd.kagi.stream")
+            .body("hi:{\"v\":\"test\",\"trace\":\"trace-1\"}\0\nnew_message.json:{\"id\":\"msg-1\",\"thread_id\":\"thread-1\",\"created_at\":\"2026-03-16T05:17:57Z\",\"state\":\"done\",\"prompt\":\"hello\",\"reply\":\"summary output\",\"md\":\"summary output\",\"metadata\":\"\",\"documents\":[{\"url\":\"https://example.com/article\"}]}\0\n");
+    });
+
+    let tempdir = TempDir::new().expect("tempdir");
+    let env = session_env(&server);
+    let output = run_kagi(
+        &[
+            "summarize",
+            "--subscriber",
+            "--url",
+            "https://example.com/article",
+            "--summary-type",
+            "keypoints",
+            "--length",
+            "digest",
+        ],
+        &env_refs(&env),
+        tempdir.path(),
+    );
+
+    assert_success(&output);
+    summarize.assert_calls(1);
+    let body: Value = serde_json::from_slice(&output.stdout).expect("json output should parse");
+    assert_eq!(body["data"]["output"], "summary output");
+}
+
+#[test]
+fn subscriber_summarize_redacts_session_token_from_error_output() {
+    let server = MockServer::start();
+    let summarize = server.mock(|when, then| {
+        when.method(POST).path("/mother/summary_labs");
+        then.status(500)
+            .header("content-type", "application/json")
+            .body(r#"{"error":"upstream echoed kagi_session=test-session"}"#);
+    });
+
+    let tempdir = TempDir::new().expect("tempdir");
+    let env = session_env(&server);
+    let output = run_kagi(
+        &[
+            "summarize",
+            "--subscriber",
+            "--url",
+            "https://example.com/article",
+        ],
+        &env_refs(&env),
+        tempdir.path(),
+    );
+
+    assert!(
+        !output.status.success(),
+        "server error should fail the command"
+    );
+    summarize.assert_calls(1);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("HTTP 500"),
+        "expected HTTP status in error: {stderr}"
+    );
+    assert!(
+        !stderr.contains("test-session"),
+        "session token must not appear in error output: {stderr}"
+    );
 }
 
 #[test]
@@ -2012,12 +2252,22 @@ fn assistant_thread_list_paginates_with_cursor_id() {
 #[test]
 fn assistant_models_prints_json_catalog() {
     let server = MockServer::start();
-    let _form = server.mock(|when, then| {
+    let _catalog = server.mock(|when, then| {
         when.method(GET)
-            .path("/settings/custom_assistant")
-            .header("cookie", "kagi_session=test-session");
+            .path("/api/init")
+            .header("cookie", "kagi_session=test-session")
+            .header("accept", "application/json");
         then.status(200)
-            .body(assistant_form_html("profile-once", "Once"));
+            .header("content-type", "application/json")
+            .json_body(json!({
+                "models": {
+                    "models": [
+                        { "id": "ki_quick", "display_name": "Quick" },
+                        { "id": "claude-5-opus-thinking", "display_name": "Claude Opus 5 (reasoning)" }
+                    ],
+                    "default": "ki_quick"
+                }
+            }));
     });
 
     let tempdir = TempDir::new().expect("tempdir");
@@ -2026,31 +2276,130 @@ fn assistant_models_prints_json_catalog() {
 
     assert_success(&output);
     let body: Value = serde_json::from_slice(&output.stdout).expect("json output should parse");
-    assert_eq!(body["models"][0]["id"], "gpt-5-mini");
-    assert_eq!(body["models"][0]["label"], "GPT 5 Mini");
-    assert_eq!(body["models"][0]["selected"], true);
-    assert_eq!(body["models"][1]["id"], "claude-4-7-opus");
+    assert_eq!(body["models"][0]["id"], "ki_quick");
+    assert_eq!(body["models"][0]["label"], "Quick");
+    assert_eq!(body["models"][1]["id"], "claude-5-opus-thinking");
+    assert_eq!(body["default"], "ki_quick");
+}
+
+#[test]
+fn assistant_custom_create_uses_current_assistant_api() {
+    let server = MockServer::start();
+    let _create = server.mock(|when, then| {
+        when.method(POST)
+            .path("/api/assistants")
+            .header("cookie", "kagi_session=test-session")
+            .header("content-type", "application/json")
+            .body_includes("\"name\":\"Release Notes\"")
+            .body_includes("\"llm_id\":\"gpt-5-4-nano\"")
+            .body_includes("\"internet_access\":true")
+            .body_includes("\"personalizations\":true")
+            .body_includes("\"lens_id\":\"2\"")
+            .body_includes("\"instructions\":\"Focus on release diffs and migration notes.\"");
+        then.status(200).json_body(custom_assistant_json(
+            "profile-release-notes",
+            "Release Notes",
+            "gpt-5-4-nano",
+        ));
+    });
+
+    let tempdir = TempDir::new().expect("tempdir");
+    let env = session_env(&server);
+    let output = run_kagi(
+        &[
+            "assistant",
+            "custom",
+            "create",
+            "Release Notes",
+            "--model",
+            "gpt-5-4-nano",
+            "--web-access",
+            "--lens",
+            "2",
+            "--instructions",
+            "Focus on release diffs and migration notes.",
+        ],
+        &env_refs(&env),
+        tempdir.path(),
+    );
+
+    assert_success(&output);
+    let body: Value = serde_json::from_slice(&output.stdout).expect("json output should parse");
+    assert_eq!(body["profile_id"], "profile-release-notes");
+    assert_eq!(body["name"], "Release Notes");
+    assert_eq!(body["base_model"], "gpt-5-4-nano");
+}
+
+#[test]
+fn assistant_custom_update_uses_current_assistant_api() {
+    let server = MockServer::start();
+    let _profiles = server.mock(|when, then| {
+        when.method(GET)
+            .path("/api/init")
+            .header("cookie", "kagi_session=test-session");
+        then.status(200)
+            .json_body(assistant_init_json(json!([custom_assistant_json(
+                "profile-writer",
+                "Writer",
+                "gpt-5-mini"
+            )])));
+    });
+    let _update = server.mock(|when, then| {
+        when.method(PATCH)
+            .path("/api/assistants/profile-writer")
+            .header("cookie", "kagi_session=test-session")
+            .header("content-type", "application/json")
+            .body_includes("\"name\":\"Release Notes\"")
+            .body_includes("\"llm_id\":\"gpt-5-4-nano\"")
+            .body_includes("\"internet_access\":false")
+            .body_includes("\"lens_id\":\"2\"")
+            .body_includes("\"instructions\":\"Use migration notes.\"");
+        then.status(200).json_body(json!({
+            "uuid": "profile-writer",
+            "name": "Release Notes",
+            "llm_id": "gpt-5-4-nano",
+            "instructions": "Use migration notes.",
+            "internet_access": false,
+            "personalizations": false,
+            "lens_id": "2",
+            "bang_trigger": null
+        }));
+    });
+
+    let tempdir = TempDir::new().expect("tempdir");
+    let env = session_env(&server);
+    let output = run_kagi(
+        &[
+            "assistant",
+            "custom",
+            "update",
+            "Writer",
+            "--name",
+            "Release Notes",
+            "--model",
+            "gpt-5-4-nano",
+            "--no-web-access",
+            "--lens",
+            "2",
+            "--instructions",
+            "Use migration notes.",
+        ],
+        &env_refs(&env),
+        tempdir.path(),
+    );
+
+    assert_success(&output);
+    let body: Value = serde_json::from_slice(&output.stdout).expect("json output should parse");
+    assert_eq!(body["profile_id"], "profile-writer");
+    assert_eq!(body["name"], "Release Notes");
+    assert_eq!(body["internet_access"], false);
+    assert_eq!(body["selected_lens"], "2");
 }
 
 #[test]
 fn assistant_stream_prints_text_deltas_by_default() {
     let server = MockServer::start();
-    let _prompt = server.mock(|when, then| {
-        when.method(POST)
-            .path("/assistant/prompt")
-            .header("cookie", "kagi_session=test-session")
-            .header("accept", "application/vnd.kagi.stream")
-            .header("content-type", "application/json");
-        then.status(200)
-            .header("content-type", "application/vnd.kagi.stream")
-            .body(concat!(
-                "hi:{\"v\":\"test\",\"trace\":\"trace-stream\"}\0\n",
-                "thread.json:{\"id\":\"thread-1\",\"title\":\"Greeting\",\"ack\":\"2026-03-16T06:19:07Z\",\"created_at\":\"2026-03-16T06:19:07Z\",\"saved\":false,\"shared\":false,\"branch_id\":\"00000000-0000-4000-0000-000000000000\",\"folder_ids\":[]}\0\n",
-                "new_message.json:{\"id\":\"msg-1\",\"thread_id\":\"thread-1\",\"created_at\":\"2026-03-16T06:19:07Z\",\"state\":\"streaming\",\"prompt\":\"Hello\",\"md\":\"Hel\",\"documents\":[]}\0\n",
-                "new_message.json:{\"id\":\"msg-1\",\"thread_id\":\"thread-1\",\"created_at\":\"2026-03-16T06:19:07Z\",\"state\":\"done\",\"prompt\":\"Hello\",\"md\":\"Hello\",\"documents\":[]}\0\n"
-            ));
-    });
-
+    mock_current_assistant_prompt(&server, "Hello", Some("Hel"), "Hello", None);
     let tempdir = TempDir::new().expect("tempdir");
     let env = session_env(&server);
     let output = run_kagi(
@@ -2066,22 +2415,7 @@ fn assistant_stream_prints_text_deltas_by_default() {
 #[test]
 fn assistant_stream_can_print_ndjson_updates() {
     let server = MockServer::start();
-    let _prompt = server.mock(|when, then| {
-        when.method(POST)
-            .path("/assistant/prompt")
-            .header("cookie", "kagi_session=test-session")
-            .header("accept", "application/vnd.kagi.stream")
-            .header("content-type", "application/json");
-        then.status(200)
-            .header("content-type", "application/vnd.kagi.stream")
-            .body(concat!(
-                "hi:{\"v\":\"test\",\"trace\":\"trace-stream\"}\0\n",
-                "thread.json:{\"id\":\"thread-1\",\"title\":\"Greeting\",\"ack\":\"2026-03-16T06:19:07Z\",\"created_at\":\"2026-03-16T06:19:07Z\",\"saved\":false,\"shared\":false,\"branch_id\":\"00000000-0000-4000-0000-000000000000\",\"folder_ids\":[]}\0\n",
-                "new_message.json:{\"id\":\"msg-1\",\"thread_id\":\"thread-1\",\"created_at\":\"2026-03-16T06:19:07Z\",\"state\":\"streaming\",\"prompt\":\"Hello\",\"md\":\"Hel\",\"documents\":[]}\0\n",
-                "new_message.json:{\"id\":\"msg-1\",\"thread_id\":\"thread-1\",\"created_at\":\"2026-03-16T06:19:07Z\",\"state\":\"done\",\"prompt\":\"Hello\",\"md\":\"Hello\",\"documents\":[]}\0\n"
-            ));
-    });
-
+    mock_current_assistant_prompt(&server, "Hello", Some("Hel"), "Hello", None);
     let tempdir = TempDir::new().expect("tempdir");
     let env = session_env(&server);
     let output = run_kagi(
@@ -2099,27 +2433,57 @@ fn assistant_stream_can_print_ndjson_updates() {
     assert_eq!(lines[0]["md_delta"], "Hel");
     assert_eq!(lines[1]["md_delta"], "lo");
     assert_eq!(lines[1]["message"]["state"], "done");
+    assert_eq!(lines[1]["message"]["usage"]["prompt_tokens"], 4314);
+    assert_eq!(lines[1]["message"]["usage"]["completion_tokens"], 2);
+    assert_eq!(lines[1]["message"]["usage"]["total_tokens"], 4316);
+    assert_eq!(lines[1]["message"]["usage"]["cost_usd"], 0.006192);
+}
+
+#[test]
+fn assistant_resolves_name_to_profile_uuid() {
+    let server = MockServer::start();
+    let message =
+        mock_current_assistant_prompt(&server, "Hello", None, "Hello", Some("profile-once"));
+    let _profiles = server.mock(|when, then| {
+        when.method(GET)
+            .path("/api/init")
+            .header("cookie", "kagi_session=test-session");
+        then.status(200)
+            .json_body(assistant_init_json(json!([custom_assistant_json(
+                "profile-once",
+                "Once",
+                "gpt-5-mini"
+            )])));
+    });
+    let tempdir = TempDir::new().expect("tempdir");
+    let env = session_env(&server);
+    let output = run_kagi(
+        &["assistant", "--assistant", "Once", "Hello"],
+        &env_refs(&env),
+        tempdir.path(),
+    );
+
+    assert_success(&output);
+    message.assert_calls(1);
+    let body: Value = serde_json::from_slice(&output.stdout).expect("json output should parse");
+    assert_eq!(body["message"]["profile"]["id"], "profile-once");
+    assert_eq!(body["message"]["profile"]["name"], "Once");
+    assert_eq!(
+        body["message"]["profile"]["edit_url"],
+        "/assistant/custom-assistants/profile-once"
+    );
 }
 
 #[test]
 fn assistant_contract_decision_prints_validated_json() {
     let server = MockServer::start();
-    let prompt = server.mock(|when, then| {
-        when.method(POST)
-            .path("/assistant/prompt")
-            .header("cookie", "kagi_session=test-session")
-            .header("accept", "application/vnd.kagi.stream")
-            .header("content-type", "application/json")
-            .body_includes("Assistant contract")
-            .body_includes("decision")
-            .body_includes("next_actions");
-        then.status(200)
-            .header("content-type", "application/vnd.kagi.stream")
-            .body(assistant_prompt_stream_body(
-                r#"{"decision":"ship","rationale":"tests pass","next_actions":["open PR"]}"#,
-            ));
-    });
-
+    let current_prompt = mock_current_assistant_prompt(
+        &server,
+        "Assistant contract",
+        None,
+        r#"{"decision":"ship","rationale":"tests pass","next_actions":["open PR"]}"#,
+        None,
+    );
     let tempdir = TempDir::new().expect("tempdir");
     let env = session_env(&server);
     let output = run_kagi(
@@ -2129,7 +2493,7 @@ fn assistant_contract_decision_prints_validated_json() {
     );
 
     assert_success(&output);
-    prompt.assert_calls(1);
+    current_prompt.assert_calls(1);
     let body: Value = serde_json::from_slice(&output.stdout).expect("json output should parse");
     assert_eq!(body["decision"], "ship");
     assert_eq!(body["rationale"], "tests pass");
@@ -2143,31 +2507,25 @@ fn assistant_contract_decision_prints_validated_json() {
 #[test]
 fn assistant_contract_file_rejects_missing_required_key() {
     let server = MockServer::start();
-    let prompt = server.mock(|when, then| {
-        when.method(POST)
-            .path("/assistant/prompt")
-            .header("cookie", "kagi_session=test-session")
-            .header("accept", "application/vnd.kagi.stream")
-            .header("content-type", "application/json")
-            .body_includes("Assistant contract")
-            .body_includes("verdict");
-        then.status(200)
-            .header("content-type", "application/vnd.kagi.stream")
-            .body(assistant_prompt_stream_body(r#"{"summary":"not enough"}"#));
-    });
-
+    let current_prompt = mock_current_assistant_prompt(
+        &server,
+        "Assistant contract",
+        None,
+        r#"{"summary":"not enough"}"#,
+        None,
+    );
     let tempdir = TempDir::new().expect("tempdir");
     let contract_path = tempdir.path().join("verdict-contract.json");
     fs::write(
         &contract_path,
         r#"{
-          "type": "object",
-          "required": ["summary", "verdict"],
-          "properties": {
-            "summary": { "type": "string" },
-            "verdict": { "type": "string" }
-          }
-        }"#,
+      "type": "object",
+      "required": ["summary", "verdict"],
+      "properties": {
+        "summary": { "type": "string" },
+        "verdict": { "type": "string" }
+      }
+    }"#,
     )
     .expect("contract file should write");
     let env = session_env(&server);
@@ -2187,7 +2545,7 @@ fn assistant_contract_file_rejects_missing_required_key() {
         !output.status.success(),
         "expected invalid contract output to fail"
     );
-    prompt.assert_calls(2);
+    current_prompt.assert_calls(2);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("assistant contract"),
@@ -2227,54 +2585,32 @@ fn completion_install_detects_fish_and_writes_completion_file() {
 #[test]
 fn assistant_once_creates_prompts_and_deletes_temporary_profile() {
     let server = MockServer::start();
-    let _new_form = server.mock(|when, then| {
+    let message = mock_current_assistant_prompt(&server, "Hi", None, "ok", Some("profile-once"));
+    let create = server.mock(|when, then| {
+        when.method(POST)
+            .path("/api/assistants")
+            .header("cookie", "kagi_session=test-session")
+            .body_includes("\"llm_id\":\"gpt-5-mini\"")
+            .body_includes("\"personalizations\":true");
+        then.status(200)
+            .json_body(custom_assistant_json("profile-once", "Once", "gpt-5-mini"));
+    });
+    let list = server.mock(|when, then| {
         when.method(GET)
-            .path("/settings/custom_assistant")
+            .path("/api/init")
             .header("cookie", "kagi_session=test-session");
         then.status(200)
-            .body(assistant_form_html("profile-once", "Once"));
+            .json_body(assistant_init_json(json!([custom_assistant_json(
+                "profile-once",
+                "Once",
+                "gpt-5-mini"
+            )])));
     });
-    let _create = server.mock(|when, then| {
-        when.method(POST)
-            .path("/settings/ast/profiles/update")
-            .header("cookie", "kagi_session=test-session")
-            .body_includes("base_model=gpt-5-mini");
-        then.status(303)
-            .header("location", "/settings/custom_assistant?id=profile-once");
-    });
-    let _list = server.mock(|when, then| {
-        when.method(GET)
-            .path("/html/settings/assistant")
+    let delete = server.mock(|when, then| {
+        when.method(DELETE)
+            .path("/api/assistants/profile-once")
             .header("cookie", "kagi_session=test-session");
-        then.status(200).body(assistant_list_html());
-    });
-    let _edit_form = server.mock(|when, then| {
-        when.method(GET)
-            .path("/settings/custom_assistant")
-            .query_param("id", "profile-once")
-            .header("cookie", "kagi_session=test-session");
-        then.status(200)
-            .body(assistant_form_html("profile-once", "Once"));
-    });
-    let _prompt = server.mock(|when, then| {
-        when.method(POST)
-            .path("/assistant/prompt")
-            .header("cookie", "kagi_session=test-session")
-            .header("accept", "application/vnd.kagi.stream");
-        then.status(200)
-            .header("content-type", "application/vnd.kagi.stream")
-            .body(concat!(
-                "hi:{\"v\":\"test\",\"trace\":\"trace-once\"}\0\n",
-                "thread.json:{\"id\":\"thread-once\",\"title\":\"Once\",\"ack\":\"2026-03-16T06:19:07Z\",\"created_at\":\"2026-03-16T06:19:07Z\",\"saved\":false,\"shared\":false,\"branch_id\":\"00000000-0000-4000-0000-000000000000\",\"folder_ids\":[]}\0\n",
-                "new_message.json:{\"id\":\"msg-once\",\"thread_id\":\"thread-once\",\"created_at\":\"2026-03-16T06:19:07Z\",\"state\":\"done\",\"prompt\":\"Hi\",\"md\":\"ok\",\"documents\":[]}\0\n"
-            ));
-    });
-    let _delete = server.mock(|when, then| {
-        when.method(POST)
-            .path("/settings/ast/profiles/delete")
-            .header("cookie", "kagi_session=test-session")
-            .body_includes("profile_id=profile-once");
-        then.status(200).body("");
+        then.status(204);
     });
 
     let tempdir = TempDir::new().expect("tempdir");
@@ -2288,6 +2624,10 @@ fn assistant_once_creates_prompts_and_deletes_temporary_profile() {
     assert_success(&output);
     let body: Value = serde_json::from_slice(&output.stdout).expect("json output should parse");
     assert_eq!(body["message"]["markdown"], "ok");
+    create.assert_calls(1);
+    list.assert_calls(2);
+    message.assert_calls(1);
+    delete.assert_calls(1);
 }
 
 #[test]
@@ -2392,11 +2732,15 @@ fn site_pref_and_history_use_local_cache_dir() {
 }
 
 #[test]
-fn mcp_initialize_returns_server_info() {
+fn mcp_server_discover_returns_modern_server_info() {
     let tempdir = TempDir::new().expect("tempdir");
+    let request = mcp_request(json!(1), "server/discover", json!({}));
     let output = run_kagi_with_stdin(
         &["mcp"],
-        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}\n",
+        &format!(
+            "{}\n",
+            serde_json::to_string(&request).expect("request serializes")
+        ),
         &[],
         tempdir.path(),
     );
@@ -2404,7 +2748,17 @@ fn mcp_initialize_returns_server_info() {
     assert_success(&output);
     let response: Value = serde_json::from_slice(&output.stdout).expect("mcp json parses");
     assert_eq!(response["id"], 1);
-    assert_eq!(response["result"]["serverInfo"]["name"], "kagi-cli");
+    assert_eq!(response["result"]["resultType"], "complete");
+    assert_eq!(
+        response["result"]["supportedVersions"],
+        json!(["2026-07-28"])
+    );
+    assert_eq!(
+        response["result"]["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
+        "kagi-cli"
+    );
+    assert_eq!(response["result"]["ttlMs"], 3600000);
+    assert_eq!(response["result"]["cacheScope"], "public");
 }
 
 fn tool_named<'a>(tools: &'a [Value], name: &str) -> &'a Value {
@@ -2417,25 +2771,49 @@ fn tool_named<'a>(tools: &'a [Value], name: &str) -> &'a Value {
 #[test]
 fn mcp_tools_list_declares_input_schemas() {
     let tempdir = TempDir::new().expect("tempdir");
+    let request = mcp_request(json!(1), "tools/list", json!({}));
     let output = run_kagi_with_stdin(
         &["mcp"],
-        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}\n",
+        &format!(
+            "{}\n",
+            serde_json::to_string(&request).expect("request serializes")
+        ),
         &[],
         tempdir.path(),
     );
 
     assert_success(&output);
     let response: Value = serde_json::from_slice(&output.stdout).expect("mcp json parses");
+    assert_eq!(response["result"]["resultType"], "complete");
+    assert_eq!(response["result"]["cacheScope"], "public");
+    assert_eq!(response["result"]["ttlMs"], 3600000);
     let tools = response["result"]["tools"].as_array().expect("tools array");
 
     for tool in tools {
         let schema = &tool["inputSchema"];
         assert_eq!(schema["type"], "object", "schema type for {tool:?}");
+        assert_eq!(
+            schema["$schema"], "https://json-schema.org/draft/2020-12/schema",
+            "schema dialect for {tool:?}"
+        );
         assert!(
             schema["properties"].is_object(),
             "expected schema properties object for {tool:?}"
         );
     }
+
+    let names: Vec<&str> = tools
+        .iter()
+        .map(|tool| tool["name"].as_str().expect("tool name"))
+        .collect();
+    assert!(
+        names.windows(2).all(|pair| pair[0] < pair[1]),
+        "tools should be returned in deterministic sorted order: {names:?}"
+    );
+    assert_eq!(
+        tool_named(tools, "kagi_search")["annotations"],
+        json!({ "readOnlyHint": true, "openWorldHint": true })
+    );
 
     assert_eq!(
         tool_named(tools, "kagi_search")["inputSchema"]["required"],
@@ -2474,6 +2852,14 @@ fn mcp_tools_list_declares_input_schemas() {
         "expected translate tool"
     );
     assert!(
+        !tools.iter().any(|tool| tool["name"] == "kagi_assistant"),
+        "assistant prompts should not be exposed by default because they create or extend threads"
+    );
+    assert!(
+        !tools.iter().any(|tool| tool["name"] == "kagi_ask_page"),
+        "page questions should not be exposed by default because they create Assistant messages"
+    );
+    assert!(
         !tools.iter().any(|tool| tool["name"] == "kagi_lens_create"),
         "mutating tools should not be exposed by default"
     );
@@ -2482,9 +2868,13 @@ fn mcp_tools_list_declares_input_schemas() {
 #[test]
 fn mcp_tools_list_exposes_mutating_tools_when_enabled() {
     let tempdir = TempDir::new().expect("tempdir");
+    let request = mcp_request(json!(1), "tools/list", json!({}));
     let output = run_kagi_with_stdin(
         &["mcp", "--enable-mutating-tools"],
-        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}\n",
+        &format!(
+            "{}\n",
+            serde_json::to_string(&request).expect("request serializes")
+        ),
         &[],
         tempdir.path(),
     );
@@ -2504,14 +2894,63 @@ fn mcp_tools_list_exposes_mutating_tools_when_enabled() {
         tool_named(tools, "kagi_cli").is_object(),
         "expected CLI parity escape hatch when mutating tools are enabled"
     );
+    assert_eq!(
+        tool_named(tools, "kagi_assistant")["annotations"]["readOnlyHint"],
+        false
+    );
+    assert_eq!(
+        tool_named(tools, "kagi_ask_page")["annotations"]["readOnlyHint"],
+        false
+    );
+    assert!(
+        tool_named(tools, "kagi_assistant")["annotations"]
+            .get("destructiveHint")
+            .is_none()
+    );
+    assert_eq!(
+        tool_named(tools, "kagi_lens_create")["annotations"]["readOnlyHint"],
+        false
+    );
+    assert_eq!(
+        tool_named(tools, "kagi_lens_delete")["annotations"]["destructiveHint"],
+        true
+    );
+    assert!(
+        tool_named(tools, "kagi_lens_update")["annotations"]
+            .get("destructiveHint")
+            .is_none()
+    );
+}
+
+#[test]
+fn mcp_tools_list_treats_null_cursor_as_absent() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let request = mcp_request(json!(1), "tools/list", json!({ "cursor": null }));
+    let output = run_kagi_with_stdin(
+        &["mcp"],
+        &format!(
+            "{}\n",
+            serde_json::to_string(&request).expect("request serializes")
+        ),
+        &[],
+        tempdir.path(),
+    );
+
+    assert_success(&output);
+    let response: Value = serde_json::from_slice(&output.stdout).expect("mcp json parses");
+    assert_eq!(response["result"]["resultType"], "complete");
 }
 
 #[test]
 fn mcp_malformed_json_returns_parse_error_and_keeps_server_alive() {
     let tempdir = TempDir::new().expect("tempdir");
+    let request = mcp_request(json!(2), "server/discover", json!({}));
     let output = run_kagi_with_stdin(
         &["mcp"],
-        "not json\n{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"initialize\"}\n",
+        &format!(
+            "not json\n{}\n",
+            serde_json::to_string(&request).expect("request serializes")
+        ),
         &[],
         tempdir.path(),
     );
@@ -2526,21 +2965,302 @@ fn mcp_malformed_json_returns_parse_error_and_keeps_server_alive() {
     assert_eq!(responses[0]["id"], Value::Null);
     assert_eq!(responses[0]["error"]["code"], -32700);
     assert_eq!(responses[1]["id"], 2);
-    assert_eq!(responses[1]["result"]["serverInfo"]["name"], "kagi-cli");
+    assert_eq!(
+        responses[1]["result"]["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
+        "kagi-cli"
+    );
+}
+
+#[test]
+fn mcp_requires_modern_request_metadata() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let output = run_kagi_with_stdin(
+        &["mcp"],
+        concat!(
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{\"_meta\":",
+            "{\"io.modelcontextprotocol/protocolVersion\":\"2026-07-28\"}}}\n"
+        ),
+        &[],
+        tempdir.path(),
+    );
+
+    assert_success(&output);
+    let response: Value = serde_json::from_slice(&output.stdout).expect("mcp json parses");
+    assert_eq!(response["error"]["code"], -32602);
+    assert!(
+        response["error"]["message"]
+            .as_str()
+            .expect("error message")
+            .contains("clientCapabilities")
+    );
+}
+
+#[test]
+fn mcp_rejects_unsupported_protocol_versions() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let request = mcp_request_with_version(json!(1), "server/discover", json!({}), "2025-11-25");
+    let output = run_kagi_with_stdin(
+        &["mcp"],
+        &format!(
+            "{}\n",
+            serde_json::to_string(&request).expect("request serializes")
+        ),
+        &[],
+        tempdir.path(),
+    );
+
+    assert_success(&output);
+    let response: Value = serde_json::from_slice(&output.stdout).expect("mcp json parses");
+    assert_eq!(response["error"]["code"], -32022);
+    assert_eq!(response["error"]["data"]["requested"], "2025-11-25");
+    assert_eq!(
+        response["error"]["data"]["supported"],
+        json!(["2026-07-28"])
+    );
+}
+
+fn mcp_stable_request(id: Value, method: &str, params: Value) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": method,
+        "params": params,
+    })
+}
+
+fn mcp_responses(stdout: &[u8]) -> Vec<Value> {
+    std::str::from_utf8(stdout)
+        .expect("mcp stdout is utf8")
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).expect("mcp json line parses"))
+        .collect()
+}
+
+#[test]
+fn mcp_auto_answers_initialize_ping_and_tools_list() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let requests = [
+        mcp_stable_request(
+            json!(1),
+            "initialize",
+            json!({
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": { "name": "opencode", "version": "1.18.21" }
+            }),
+        ),
+        mcp_stable_request(json!(2), "tools/list", json!({})),
+        mcp_stable_request(json!(3), "ping", json!({})),
+        mcp_stable_request(json!(4), "server/discover", json!({})),
+    ];
+    let stdin = requests
+        .iter()
+        .map(|request| serde_json::to_string(request).expect("request serializes"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let output = run_kagi_with_stdin(&["mcp"], &format!("{stdin}\n"), &[], tempdir.path());
+
+    assert_success(&output);
+    let responses = mcp_responses(&output.stdout);
+    assert_eq!(
+        responses.len(),
+        4,
+        "one response per request: {responses:?}"
+    );
+
+    let initialize = responses
+        .iter()
+        .find(|response| response["id"] == 1)
+        .expect("initialize response");
+    assert_eq!(initialize["result"]["protocolVersion"], "2025-06-18");
+    assert_eq!(initialize["result"]["serverInfo"]["name"], "kagi-cli");
+    assert!(
+        initialize["result"]["capabilities"]["tools"].is_object(),
+        "initialize should advertise tools capability: {initialize:?}"
+    );
+
+    let tools_list = responses
+        .iter()
+        .find(|response| response["id"] == 2)
+        .expect("tools/list response");
+    let tools = tools_list["result"]["tools"]
+        .as_array()
+        .expect("tools array");
+    assert!(!tools.is_empty(), "stable tools list should not be empty");
+
+    let ping = responses
+        .iter()
+        .find(|response| response["id"] == 3)
+        .expect("ping response");
+    assert_eq!(ping["result"], json!({}));
+
+    let discover = responses
+        .iter()
+        .find(|response| response["id"] == 4)
+        .expect("server/discover response");
+    assert_eq!(
+        discover["error"]["code"], -32601,
+        "draft-only server/discover should be unknown without draft metadata: {discover:?}"
+    );
+}
+
+#[test]
+fn mcp_auto_falls_back_to_latest_supported_version() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let request = mcp_stable_request(
+        json!(1),
+        "initialize",
+        json!({
+            "protocolVersion": "1999-01-01",
+            "capabilities": {},
+            "clientInfo": { "name": "opencode", "version": "1.18.21" }
+        }),
+    );
+    let output = run_kagi_with_stdin(
+        &["mcp"],
+        &format!(
+            "{}\n",
+            serde_json::to_string(&request).expect("request serializes")
+        ),
+        &[],
+        tempdir.path(),
+    );
+
+    assert_success(&output);
+    let response: Value = serde_json::from_slice(&output.stdout).expect("mcp json parses");
+    assert_eq!(response["result"]["protocolVersion"], "2025-11-25");
+}
+
+#[test]
+fn mcp_auto_answers_initialize_without_draft_metadata() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let output = run_kagi_with_stdin(
+        &["mcp"],
+        concat!(
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",",
+            "\"params\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{},",
+            "\"clientInfo\":{\"name\":\"opencode\",\"version\":\"1.18.21\"}}}\n"
+        ),
+        &[],
+        tempdir.path(),
+    );
+
+    assert_success(&output);
+    let response: Value = serde_json::from_slice(&output.stdout).expect("mcp json parses");
+    assert_eq!(response["id"], 1);
+    assert!(
+        response.get("error").is_none(),
+        "initialize without draft metadata should be answered, not rejected: {response:?}"
+    );
+    assert_eq!(response["result"]["protocolVersion"], "2025-06-18");
+    assert_eq!(response["result"]["serverInfo"]["name"], "kagi-cli");
+}
+
+#[test]
+fn mcp_auto_unknown_tool_without_draft_metadata_returns_json_rpc_error() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let request = mcp_stable_request(
+        json!(1),
+        "tools/call",
+        json!({
+            "name": "kagi_nope",
+            "arguments": {}
+        }),
+    );
+    let output = run_kagi_with_stdin(
+        &["mcp"],
+        &format!(
+            "{}\n",
+            serde_json::to_string(&request).expect("request serializes")
+        ),
+        &[],
+        tempdir.path(),
+    );
+
+    assert_success(&output);
+    let response: Value = serde_json::from_slice(&output.stdout).expect("mcp json parses");
+    assert_eq!(response["id"], 1);
+    assert_eq!(response["error"]["code"], -32602);
+    assert!(
+        response["error"]["message"]
+            .as_str()
+            .expect("message")
+            .contains("Unknown tool")
+    );
+}
+
+#[test]
+fn mcp_auto_negotiates_per_request_in_one_session() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let requests = [
+        mcp_request(json!(1), "server/discover", json!({})),
+        mcp_stable_request(
+            json!(2),
+            "initialize",
+            json!({
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": { "name": "opencode", "version": "1.18.21" }
+            }),
+        ),
+        mcp_request(json!(3), "tools/list", json!({})),
+        mcp_stable_request(json!(4), "tools/list", json!({})),
+    ];
+    let stdin = requests
+        .iter()
+        .map(|request| serde_json::to_string(request).expect("request serializes"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let output = run_kagi_with_stdin(&["mcp"], &format!("{stdin}\n"), &[], tempdir.path());
+
+    assert_success(&output);
+    let responses = mcp_responses(&output.stdout);
+    assert_eq!(
+        responses.len(),
+        4,
+        "one response per request: {responses:?}"
+    );
+
+    let discover = responses
+        .iter()
+        .find(|response| response["id"] == 1)
+        .expect("draft server/discover response");
+    assert_eq!(
+        discover["result"]["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
+        "kagi-cli"
+    );
+
+    let initialize = responses
+        .iter()
+        .find(|response| response["id"] == 2)
+        .expect("stable initialize response");
+    assert_eq!(initialize["result"]["protocolVersion"], "2025-06-18");
+
+    let draft_tools_list = responses
+        .iter()
+        .find(|response| response["id"] == 3)
+        .expect("draft tools/list response");
+    assert_eq!(draft_tools_list["result"]["resultType"], "complete");
+
+    let stable_tools_list = responses
+        .iter()
+        .find(|response| response["id"] == 4)
+        .expect("stable tools/list response");
+    assert!(stable_tools_list["result"]["tools"].is_array());
 }
 
 #[test]
 fn mcp_unknown_tool_returns_json_rpc_error() {
     let tempdir = TempDir::new().expect("tempdir");
-    let request = json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "tools/call",
-        "params": {
+    let request = mcp_request(
+        json!(1),
+        "tools/call",
+        json!({
             "name": "kagi_nope",
             "arguments": {}
-        }
-    });
+        }),
+    );
     let mut stdin = serde_json::to_string(&request).expect("request serializes");
     stdin.push('\n');
 
@@ -2549,27 +3269,26 @@ fn mcp_unknown_tool_returns_json_rpc_error() {
     assert_success(&output);
     let response: Value = serde_json::from_slice(&output.stdout).expect("mcp json parses");
     assert_eq!(response["id"], 1);
-    assert_eq!(response["error"]["code"], -32000);
+    assert_eq!(response["error"]["code"], -32602);
     assert!(
         response["error"]["message"]
             .as_str()
             .expect("message")
-            .contains("unsupported MCP tool")
+            .contains("Unknown tool")
     );
 }
 
 #[test]
 fn mcp_cli_passthrough_runs_auth_free_commands_when_enabled() {
     let tempdir = TempDir::new().expect("tempdir");
-    let request = json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "tools/call",
-        "params": {
+    let request = mcp_request(
+        json!(1),
+        "tools/call",
+        json!({
             "name": "kagi_cli",
             "arguments": { "args": ["--help"] }
-        }
-    });
+        }),
+    );
     let mut stdin = serde_json::to_string(&request).expect("request serializes");
     stdin.push('\n');
 
@@ -2618,15 +3337,14 @@ fn mcp_cli_passthrough_closes_stdin_when_payload_is_omitted() {
         let _ = tx.send(read.map(|_| line));
     });
 
-    let request = json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "tools/call",
-        "params": {
+    let request = mcp_request(
+        json!(1),
+        "tools/call",
+        json!({
             "name": "kagi_cli",
             "arguments": { "args": ["batch"] }
-        }
-    });
+        }),
+    );
     writeln!(stdin, "{request}").expect("request should write");
     stdin.flush().expect("request should flush");
 
@@ -2689,15 +3407,28 @@ fn mcp_extract_tool_call_returns_markdown() {
 
     let tempdir = TempDir::new().expect("tempdir");
     let env = test_env(&server);
+    let request = mcp_request(
+        json!(1),
+        "tools/call",
+        json!({
+            "name": "kagi_extract",
+            "arguments": { "url": "https://example.com/article" }
+        }),
+    );
     let output = run_kagi_with_stdin(
         &["mcp"],
-        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"kagi_extract","arguments":{"url":"https://example.com/article"}}}"#,
+        &format!(
+            "{}\n",
+            serde_json::to_string(&request).expect("request serializes")
+        ),
         &env_refs(&env),
         tempdir.path(),
     );
 
     assert_success(&output);
     let response: Value = serde_json::from_slice(&output.stdout).expect("mcp json parses");
+    assert_eq!(response["result"]["resultType"], "complete");
+    assert_eq!(response["result"]["isError"], false);
     assert_eq!(
         response["result"]["content"][0]["text"],
         "# Article\n\nExtracted content."
@@ -2738,18 +3469,17 @@ fn mcp_extract_explicit_json_overrides_default_output() {
 
     let tempdir = TempDir::new().expect("tempdir");
     let env = test_env(&server);
-    let request = json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "tools/call",
-        "params": {
+    let request = mcp_request(
+        json!(1),
+        "tools/call",
+        json!({
             "name": "kagi_extract",
             "arguments": {
                 "url": "https://example.com/article",
                 "format": "json"
             }
-        }
-    });
+        }),
+    );
     let mut stdin = serde_json::to_string(&request).expect("request serializes");
     stdin.push('\n');
 
@@ -2768,6 +3498,10 @@ fn mcp_extract_explicit_json_overrides_default_output() {
     let body: Value = serde_json::from_str(text).expect("inner extract should stay JSON");
     assert_eq!(
         body["data"][0]["markdown"],
+        "# Article\n\nExtracted content."
+    );
+    assert_eq!(
+        response["result"]["structuredContent"]["data"][0]["markdown"],
         "# Article\n\nExtracted content."
     );
 }
@@ -2791,15 +3525,14 @@ fn mcp_search_uses_default_output_format() {
 
     let tempdir = TempDir::new().expect("tempdir");
     let env = test_env(&server);
-    let request = json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "tools/call",
-        "params": {
+    let request = mcp_request(
+        json!(1),
+        "tools/call",
+        json!({
             "name": "kagi_search",
             "arguments": { "query": "rust" }
-        }
-    });
+        }),
+    );
     let mut stdin = serde_json::to_string(&request).expect("request serializes");
     stdin.push('\n');
 
@@ -2826,20 +3559,85 @@ fn mcp_search_uses_default_output_format() {
 }
 
 #[test]
+fn mcp_only_exposes_structured_content_for_json_output() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let request = mcp_request(
+        json!(1),
+        "tools/call",
+        json!({
+            "name": "kagi_history_stats",
+            "arguments": {}
+        }),
+    );
+    let mut stdin = serde_json::to_string(&request).expect("request serializes");
+    stdin.push('\n');
+
+    let output = run_kagi_with_stdin(
+        &["mcp", "--default-output", "pretty"],
+        &stdin,
+        &[],
+        tempdir.path(),
+    );
+
+    assert_success(&output);
+    let response: Value = serde_json::from_slice(&output.stdout).expect("mcp json parses");
+    let result = &response["result"];
+    assert_eq!(result["isError"], false);
+    let text = result["content"][0]["text"].as_str().expect("text content");
+    serde_json::from_str::<Value>(text).expect("pretty output should remain valid JSON text");
+    assert!(
+        result.get("structuredContent").is_none(),
+        "pretty output must not be duplicated as structured content"
+    );
+}
+
+#[test]
+fn mcp_explicit_json_format_exposes_structured_content_for_news_metadata() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let request = mcp_request(
+        json!(1),
+        "tools/call",
+        json!({
+            "name": "kagi_news_filter_presets",
+            "arguments": { "format": "json" }
+        }),
+    );
+    let mut stdin = serde_json::to_string(&request).expect("request serializes");
+    stdin.push('\n');
+
+    let output = run_kagi_with_stdin(
+        &["mcp", "--default-output", "pretty"],
+        &stdin,
+        &[],
+        tempdir.path(),
+    );
+
+    assert_success(&output);
+    let response: Value = serde_json::from_slice(&output.stdout).expect("mcp json parses");
+    let result = &response["result"];
+    assert_eq!(result["isError"], false);
+    let text = result["content"][0]["text"].as_str().expect("text content");
+    serde_json::from_str::<Value>(text).expect("explicit JSON output should parse");
+    assert!(
+        result.get("structuredContent").is_some(),
+        "explicit JSON output must be exposed as structured content"
+    );
+}
+
+#[test]
 fn mcp_batch_search_rejects_zero_concurrency() {
     let tempdir = TempDir::new().expect("tempdir");
-    let request = json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "tools/call",
-        "params": {
+    let request = mcp_request(
+        json!(1),
+        "tools/call",
+        json!({
             "name": "kagi_batch_search",
             "arguments": {
                 "queries": ["rust"],
                 "concurrency": 0
             }
-        }
-    });
+        }),
+    );
     let mut stdin = serde_json::to_string(&request).expect("request serializes");
     stdin.push('\n');
 
@@ -2852,9 +3650,10 @@ fn mcp_batch_search_rejects_zero_concurrency() {
 
     assert_success(&output);
     let response: Value = serde_json::from_slice(&output.stdout).expect("mcp json parses");
-    assert_eq!(response["error"]["code"], -32000);
+    assert_eq!(response["result"]["resultType"], "complete");
+    assert_eq!(response["result"]["isError"], true);
     assert!(
-        response["error"]["message"]
+        response["result"]["content"][0]["text"]
             .as_str()
             .expect("message")
             .contains("concurrency must be at least 1")
@@ -2911,6 +3710,9 @@ fn mcp_assistant_thread_export_json_overrides_default_output() {
                             "content": "Hello back",
                             "html_content": "<p>Hello back</p>",
                             "created_at": "2026-03-16T06:20:07Z",
+                            "input_tokens": 4314,
+                            "output_tokens": 2,
+                            "cost_usd": 0.006192,
                             "references": []
                         }
                     ],
@@ -2921,18 +3723,17 @@ fn mcp_assistant_thread_export_json_overrides_default_output() {
 
     let tempdir = TempDir::new().expect("tempdir");
     let env = session_env(&server);
-    let request = json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "tools/call",
-        "params": {
+    let request = mcp_request(
+        json!(1),
+        "tools/call",
+        json!({
             "name": "kagi_assistant_thread_export",
             "arguments": {
                 "thread_id": "thread-1",
                 "format": "json"
             }
-        }
-    });
+        }),
+    );
     let mut stdin = serde_json::to_string(&request).expect("request serializes");
     stdin.push('\n');
 
@@ -2952,6 +3753,10 @@ fn mcp_assistant_thread_export_json_overrides_default_output() {
     assert_eq!(body["thread"]["id"], "thread-1");
     assert_eq!(body["messages"][0]["prompt"], "Hello");
     assert_eq!(body["messages"][0]["markdown"], "Hello back");
+    assert_eq!(body["messages"][0]["usage"]["prompt_tokens"], 4314);
+    assert_eq!(body["messages"][0]["usage"]["completion_tokens"], 2);
+    assert_eq!(body["messages"][0]["usage"]["total_tokens"], 4316);
+    assert_eq!(body["messages"][0]["usage"]["cost_usd"], 0.006192);
 }
 
 #[test]
@@ -2991,15 +3796,14 @@ fn mcp_news_tool_call_returns_stories() {
 
     let tempdir = TempDir::new().expect("tempdir");
     let env = test_env(&server);
-    let request = json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "tools/call",
-        "params": {
+    let request = mcp_request(
+        json!(1),
+        "tools/call",
+        json!({
             "name": "kagi_news",
             "arguments": { "category": "tech", "lang": "en", "limit": 3 }
-        }
-    });
+        }),
+    );
     let mut stdin = serde_json::to_string(&request).expect("request serializes");
     stdin.push('\n');
 
@@ -3032,19 +3836,18 @@ fn mcp_news_search_tool_call_returns_clusters() {
 
     let tempdir = TempDir::new().expect("tempdir");
     let env = session_env(&server);
-    let request = json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "tools/call",
-        "params": {
+    let request = mcp_request(
+        json!(1),
+        "tools/call",
+        json!({
             "name": "kagi_news_search",
             "arguments": {
                 "query": "iran",
                 "freshness": "day",
                 "order": "recency"
             }
-        }
-    });
+        }),
+    );
     let mut stdin = serde_json::to_string(&request).expect("request serializes");
     stdin.push('\n');
 
@@ -3105,24 +3908,22 @@ fn mcp_tool_call_error_returns_json_rpc_error_and_keeps_server_alive() {
     let env = session_env(&server);
 
     // Send a search tool call (will fail) followed by a news tool call (should succeed).
-    let failing_request = json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "tools/call",
-        "params": {
+    let failing_request = mcp_request(
+        json!(1),
+        "tools/call",
+        json!({
             "name": "kagi_search",
             "arguments": { "query": "test" }
-        }
-    });
-    let succeeding_request = json!({
-        "jsonrpc": "2.0",
-        "id": 2,
-        "method": "tools/call",
-        "params": {
+        }),
+    );
+    let succeeding_request = mcp_request(
+        json!(2),
+        "tools/call",
+        json!({
             "name": "kagi_news",
             "arguments": { "category": "tech", "lang": "en", "limit": 3 }
-        }
-    });
+        }),
+    );
 
     let stdin = format!(
         "{}\n{}\n",
@@ -3141,16 +3942,20 @@ fn mcp_tool_call_error_returns_json_rpc_error_and_keeps_server_alive() {
 
     assert_eq!(responses.len(), 2, "expected two JSON-RPC responses");
 
-    // First response: the failed tool call should be a JSON-RPC error, not a crash.
+    // First response: the failed tool call should be an MCP tool error result, not a crash.
     let error_resp = &responses[0];
     assert_eq!(error_resp["id"], 1);
     assert!(
-        error_resp.get("error").is_some(),
-        "expected JSON-RPC error for failed tool call, got: {error_resp}"
+        error_resp.get("result").is_some(),
+        "expected MCP tool result for failed tool call, got: {error_resp}"
     );
-    assert_eq!(error_resp["error"]["code"], -32000);
+    assert_eq!(error_resp["result"]["resultType"], "complete");
+    assert_eq!(error_resp["result"]["isError"], true);
     assert!(
-        !error_resp["error"]["message"].as_str().unwrap().is_empty(),
+        !error_resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .is_empty(),
         "error message should be non-empty"
     );
 
@@ -3161,4 +3966,160 @@ fn mcp_tool_call_error_returns_json_rpc_error_and_keeps_server_alive() {
         success_resp.get("result").is_some(),
         "expected successful result for second tool call, got: {success_resp}"
     );
+}
+#[test]
+fn generate_completion_with_subcommand_exits_usage_error() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let output = run_kagi(
+        &["--generate-completion", "bash", "auth", "status"],
+        &[],
+        tempdir.path(),
+    );
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "usage conflict should exit 2, got {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("cannot be used with a command"),
+        "expected conflict explanation on stderr, got:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn fastgpt_rejects_disabled_web_search_before_network() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let output = run_kagi(
+        &[
+            "fastgpt",
+            "--web-search",
+            "false",
+            "What is the capital of Australia?",
+        ],
+        &[],
+        tempdir.path(),
+    );
+
+    assert!(
+        !output.status.success(),
+        "web_search false should fail, got {:?}",
+        output.status.code()
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("not supported"),
+        "expected upstream support explanation on stderr, got:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn summarize_filter_streams_per_item_envelopes() {
+    let server = MockServer::start();
+    let _good = server.mock(|when, then| {
+        when.method(POST)
+            .path("/api/v0/summarize")
+            .header("authorization", "Bot test-api-token")
+            .body_includes("good.example");
+        then.status(200)
+            .header("content-type", "application/json")
+            .json_body(json!({
+                "meta": api_meta(),
+                "data": {
+                    "output": "A concise summary.",
+                    "tokens": 42
+                }
+            }));
+    });
+    let _bad = server.mock(|when, then| {
+        when.method(POST)
+            .path("/api/v0/summarize")
+            .header("authorization", "Bot test-api-token")
+            .body_includes("bad.example");
+        then.status(500)
+            .header("content-type", "application/json")
+            .json_body(json!({
+                "meta": api_meta(),
+                "error": { "code": "internal_error", "msg": "boom" }
+            }));
+    });
+
+    let tempdir = TempDir::new().expect("tempdir");
+    let env = test_env(&server);
+    let output = run_kagi_with_stdin(
+        &["summarize", "--filter"],
+        "https://good.example/article\nhttps://bad.example/article\n",
+        &env_refs(&env),
+        tempdir.path(),
+    );
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "expected exit 1 when one filter item fails, got {:?}",
+        output.status.code()
+    );
+    let records = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("JSONL record should parse"))
+        .collect::<Vec<_>>();
+    assert_eq!(records.len(), 2, "both items must be processed");
+    assert_eq!(records[0]["input"], "https://good.example/article");
+    assert_eq!(records[0]["ok"], true);
+    assert_eq!(
+        records[0]["response"]["data"]["output"],
+        "A concise summary."
+    );
+    assert_eq!(records[1]["input"], "https://bad.example/article");
+    assert_eq!(records[1]["ok"], false);
+    assert!(
+        records[1]["error"].is_object(),
+        "failed item must carry an error envelope, got: {}",
+        records[1]
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("summarize --filter completed with 1 failed item"),
+        "expected aggregate failure on stderr, got:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn concurrent_site_pref_sets_preserve_all_domains() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let dir = tempdir.path().to_path_buf();
+    let mut handles = Vec::new();
+    for index in 0..8 {
+        let dir = dir.clone();
+        handles.push(std::thread::spawn(move || {
+            let domain = format!("domain-{index}.example");
+            run_kagi(&["site-pref", "set", &domain, "--mode", "pin"], &[], &dir)
+        }));
+    }
+    for handle in handles {
+        let output = handle.join().expect("worker thread");
+        assert!(
+            output.status.success(),
+            "concurrent site-pref set should succeed, got {:?}\nstderr:\n{}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let list = run_kagi(&["site-pref", "list"], &[], &dir);
+    assert_success(&list);
+    let prefs: Value = serde_json::from_slice(&list.stdout).expect("prefs json parses");
+    for index in 0..8 {
+        let domain = format!("domain-{index}.example");
+        assert_eq!(
+            prefs["domains"][domain.as_str()],
+            "pin",
+            "concurrent update for {domain} must survive"
+        );
+    }
 }
